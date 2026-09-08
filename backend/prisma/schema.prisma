@@ -1,0 +1,85 @@
+// Prisma schema for the Nifty 50 options-signal tracker.
+// Run `npm run db:migrate` after editing this file.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Direction {
+  CALL
+  PUT
+}
+
+enum ExpiryType {
+  CURRENT_WEEK
+  NEXT_WEEK
+}
+
+enum TradeStatus {
+  ACTIVE
+  TARGET_HIT
+  STOPLOSS_HIT
+}
+
+enum TargetBasis {
+  PIVOT
+  ATR
+}
+
+/// One generated trading signal — a persisted, monitored position from
+/// entry until it resolves (or the market closes for the day still active).
+model TradeSignal {
+  id             String      @id @default(uuid())
+  /// @db.Timestamptz — an absolute instant, immune to the DB session's
+  /// timezone setting. This server's Postgres session timezone happens to
+  /// be Asia/Kolkata; a plain (tz-naive) "timestamp" column would silently
+  /// store IST wall-clock digits that then get *re*-interpreted as UTC on
+  /// read, double-shifting every displayed time forward by 5:30.
+  timestamp      DateTime    @default(now()) @db.Timestamptz(3)
+  /// IST calendar date (YYYY-MM-DD) the signal was generated on — denormalized
+  /// off `timestamp` so the daily-throttle and "today" queries never need a
+  /// timezone-aware range scan, just an indexed equality match.
+  dateString     String
+  direction      Direction
+  strikePrice    Float
+  expiryType     ExpiryType
+  entrySpotPrice Float
+  stopLossSpot   Float
+  targetSpot     Float
+  currentStatus  TradeStatus @default(ACTIVE)
+  /// When/where the position was resolved by the 10s monitor (null while ACTIVE).
+  resolvedAt     DateTime?   @db.Timestamptz(3)
+  resolvedSpot   Float?
+  /// The most favorable spot price seen since entry (highest for a CALL,
+  /// lowest for a PUT) — updated by the 10s position monitor every tick it
+  /// improves. Null until the first tick after creation. The frontend
+  /// derives "peak points" as |peakSpot - entrySpotPrice|.
+  peakSpot       Float?
+  /// The ATR(14) reading (index points) this trade's SL/target distances
+  /// were sized from at creation — persisted so the exact original levels
+  /// can always be reconstructed and displayed, even as ATR keeps moving
+  /// on every later tick. Nullable only for rows from before this field existed.
+  atr14          Float?
+  /// Whether `targetSpot` came from the nearest support/resistance pivot
+  /// or a symmetric ATR distance — see SignalsService.resolveTargetPoints().
+  /// Nullable only for rows from before this field existed.
+  targetBasis    TargetBasis?
+
+  // --- Indexes -------------------------------------------------------------
+  // dateString:               daily-throttle COUNT and GET /signals/today
+  // currentStatus:            the 10s position monitor's "WHERE ACTIVE" scan
+  // direction / expiryType:   archive filter dropdowns
+  // [dateString, currentStatus]: composite for the common "today's active" path
+  // timestamp:                archive default sort / date-range filtering
+  @@index([dateString])
+  @@index([currentStatus])
+  @@index([direction])
+  @@index([expiryType])
+  @@index([dateString, currentStatus])
+  @@index([timestamp])
+}

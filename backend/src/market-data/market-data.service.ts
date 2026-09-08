@@ -29,6 +29,28 @@ export class MarketDataService {
     return this.fetchCandles(symbol, '5m', lookbackDays);
   }
 
+  /**
+   * Fetches just the current spot price — used by the 10-second position
+   * monitor, which needs a fast, cheap check rather than a full candle pull
+   * on every tick.
+   */
+  async fetchLiveSpot(symbol: string): Promise<number> {
+    try {
+      const quote = await this.yahooFinance.quote(symbol, { fields: ['regularMarketPrice'] });
+      const price = quote?.regularMarketPrice;
+
+      if (price === undefined || price === null || Number.isNaN(price)) {
+        throw new Error(`Yahoo Finance returned no regularMarketPrice for symbol ${symbol}`);
+      }
+
+      return price;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error(`Failed to fetch live spot for ${symbol}: ${message}`);
+      throw new Error(`MarketDataService: unable to fetch live spot for ${symbol} — ${message}`);
+    }
+  }
+
   /** Generic candle fetch, reused by any interval the strategy might need. */
   private async fetchCandles(symbol: string, interval: ChartInterval, lookbackDays: number): Promise<CandleBar[]> {
     try {

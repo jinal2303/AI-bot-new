@@ -12,6 +12,12 @@ const badgeVariants = cva(
         outline: 'border-border text-foreground',
         bullish: 'border-transparent bg-bullish text-bullish-foreground',
         bearish: 'border-transparent bg-bearish text-bearish-foreground',
+        // Trade-status badges (Screen 1's live table) — deliberately loud,
+        // saturated colors distinct from the theme's bullish/bearish tones
+        // so a status reads at a glance across a full day's row of trades.
+        active: 'animate-pulse border-transparent bg-amber-400 text-amber-950',
+        target: 'border-transparent bg-emerald-500 text-emerald-950',
+        stoploss: 'border-transparent bg-red-800 text-red-50',
       },
     },
     defaultVariants: {
