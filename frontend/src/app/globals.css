@@ -1,0 +1,61 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Dark theme is the only theme for this dashboard, defined on :root
+       so it applies without needing a `dark` class toggle. */
+    --background: 240 10% 6%;
+    --foreground: 210 20% 96%;
+
+    --card: 240 8% 10%;
+    --card-foreground: 210 20% 96%;
+
+    --primary: 217 91% 60%;
+    --primary-foreground: 210 20% 98%;
+
+    --secondary: 240 6% 16%;
+    --secondary-foreground: 210 20% 90%;
+
+    --muted: 240 6% 16%;
+    --muted-foreground: 215 15% 65%;
+
+    --accent: 240 6% 18%;
+    --accent-foreground: 210 20% 96%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 210 20% 98%;
+
+    --bullish: 142 71% 45%;
+    --bullish-foreground: 144 61% 96%;
+
+    --bearish: 0 72% 51%;
+    --bearish-foreground: 0 86% 97%;
+
+    --border: 240 6% 20%;
+    --input: 240 6% 20%;
+    --ring: 217 91% 60%;
+
+    --radius: 0.75rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings:
+      'rlig' 1,
+      'calt' 1;
+  }
+}
+
+/* Subtle scanning glow used behind the hero spot-price card */
+.grid-glow {
+  background-image:
+    radial-gradient(circle at 20% 20%, hsl(var(--primary) / 0.12), transparent 40%),
+    radial-gradient(circle at 80% 0%, hsl(var(--bullish) / 0.08), transparent 35%);
+}
