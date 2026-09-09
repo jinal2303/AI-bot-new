@@ -29,6 +29,8 @@ export function ArchiveFiltersBar({ filters, onChange }: ArchiveFiltersBarProps)
           <option value="ACTIVE">Active</option>
           <option value="TARGET_HIT">Target Hit</option>
           <option value="STOPLOSS_HIT">Stop-Loss Hit</option>
+          <option value="TRAIL_STOP_HIT">Trailing Stop Hit</option>
+          <option value="TIME_EXIT">Time Exit</option>
         </Select>
       </Field>
 

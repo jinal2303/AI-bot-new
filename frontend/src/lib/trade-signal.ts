@@ -10,7 +10,17 @@ export type TradeDirection = 'CALL' | 'PUT';
 
 export type TradeExpiryType = 'CURRENT_WEEK' | 'NEXT_WEEK';
 
-export type TradeStatus = 'ACTIVE' | 'TARGET_HIT' | 'STOPLOSS_HIT';
+/**
+ * TRAIL_STOP_HIT — a trailing stop (breakeven or profit-lock) was hit
+ * instead of the original entry-time risk stop; unlike STOPLOSS_HIT this is
+ * always a scratch-or-better outcome. TIME_EXIT — the position went stale
+ * (open too long, in profit, momentum stalled) and was force-closed at
+ * market. See backend/src/trades/position-monitor.service.ts.
+ */
+export type TradeStatus = 'ACTIVE' | 'TARGET_HIT' | 'STOPLOSS_HIT' | 'TRAIL_STOP_HIT' | 'TIME_EXIT';
+
+/** Progression of the dynamic trailing stop-loss — see PositionMonitorService.applyTrailingStop(). */
+export type TrailStage = 'NONE' | 'BREAKEVEN' | 'PROFIT_LOCK';
 
 export interface TradeSignal {
   id: string;
@@ -20,7 +30,9 @@ export interface TradeSignal {
   strikePrice: number;
   expiryType: TradeExpiryType;
   entrySpotPrice: number;
+  /** Live, current stop-loss — ratcheted by the trailing-stop rules as the trade moves favorably; see `trailStage`. */
   stopLossSpot: number;
+  /** Live, current target — may have been pulled in once by the stale-position rule; see `staleAdjusted`. */
   targetSpot: number;
   currentStatus: TradeStatus;
   resolvedAt: string | null;
@@ -31,8 +43,12 @@ export interface TradeSignal {
   atr14: number | null;
   /** Whether `targetSpot` came from a support/resistance pivot or a symmetric ATR distance. Null for legacy rows predating this field. */
   targetBasis: 'PIVOT' | 'ATR' | null;
-  /** Realized cash P&L for 1 lot at resolution — positive for TARGET_HIT, negative for STOPLOSS_HIT. Null while ACTIVE. */
+  /** Realized cash P&L for 1 lot at resolution — positive for TARGET_HIT/TRAIL_STOP_HIT, negative for STOPLOSS_HIT, either for TIME_EXIT. Null while ACTIVE. */
   netCashINR: number | null;
+  /** How far the dynamic trailing stop has progressed — NONE means `stopLossSpot` is still the original entry-time risk stop. */
+  trailStage: TrailStage;
+  /** Whether the one-time stale-position target reduction has already fired for this position. */
+  staleAdjusted: boolean;
 }
 
 /** Peak favorable move, in index points, since entry — null if not yet tracked. */

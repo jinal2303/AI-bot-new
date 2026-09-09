@@ -1,8 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Direction, ExpiryType, Prisma, TargetBasis, TradeSignal, TradeStatus } from '@prisma/client';
+import { Direction, ExpiryType, Prisma, TargetBasis, TradeSignal, TradeStatus, TrailStage } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { toISTIsoDate } from '../common/ist-time.util';
 import { ArchiveQueryDto } from './dto/archive-query.dto';
+
+/** Every terminal status the 10s position monitor can resolve an ACTIVE position to. */
+export type ExitStatus = Exclude<TradeStatus, typeof TradeStatus.ACTIVE>;
 
 export interface CreateTradeSignalInput {
   direction: Direction;
@@ -82,13 +85,13 @@ export class TradesService {
   }
 
   /**
-   * Flips a position to TARGET_HIT / STOPLOSS_HIT, recording the resolving
-   * spot price, the final peak-favorable price, and the realized cash P&L
-   * in one write.
+   * Flips a position to a terminal status (TARGET_HIT / STOPLOSS_HIT /
+   * TRAIL_STOP_HIT / TIME_EXIT), recording the resolving spot price, the
+   * final peak-favorable price, and the realized cash P&L in one write.
    */
   async resolvePosition(
     id: string,
-    status: typeof TradeStatus.TARGET_HIT | typeof TradeStatus.STOPLOSS_HIT,
+    status: ExitStatus,
     resolvedSpot: number,
     peakSpot: number,
     netCashINR: number,
@@ -99,9 +102,26 @@ export class TradesService {
     });
   }
 
-  /** Records a new best-favorable price for a still-open position (only called when it actually improves). */
-  async updatePeakSpot(id: string, peakSpot: number): Promise<void> {
-    await this.prisma.tradeSignal.update({ where: { id }, data: { peakSpot } });
+  /**
+   * Persists any subset of a still-ACTIVE position's live-tracking fields —
+   * the new peak-favorable price, a trailing-stop adjustment
+   * (stopLossSpot + trailStage), and/or the one-time stale-exit target
+   * reduction (targetSpot + staleAdjusted). Written to the DB the instant
+   * they change (not just held in memory) so every level survives a
+   * restart of this service — the next tick simply re-reads it from
+   * `findActivePositions()`.
+   */
+  async updateActivePosition(
+    id: string,
+    data: Partial<{
+      peakSpot: number;
+      stopLossSpot: number;
+      targetSpot: number;
+      trailStage: TrailStage;
+      staleAdjusted: boolean;
+    }>,
+  ): Promise<void> {
+    await this.prisma.tradeSignal.update({ where: { id }, data });
   }
 
   /** Every signal generated today (any status), newest first — powers the live dashboard table. */

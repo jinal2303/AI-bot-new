@@ -1,4 +1,4 @@
-import { ArrowDownRight, ArrowUpRight, CalendarClock, Radio, Timer, TrendingUp, Zap } from 'lucide-react';
+import { ArrowDownRight, ArrowUpRight, CalendarClock, Radio, Shield, ShieldCheck, Timer, TrendingUp, Zap } from 'lucide-react';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { StatusBadge } from '@/components/status-badge';
 import { callType, formatDuration, holdDurationMs, liveUnrealizedCashINR, peakPoints, TradeSignal } from '@/lib/trade-signal';
@@ -90,7 +90,24 @@ function SignalRow({ row, livePrice }: { row: TradeSignal; livePrice: number | n
         {row.expiryType === 'CURRENT_WEEK' ? 'Current Week' : 'Next Week'}
       </TableCell>
       <TableCell className="text-right tabular-nums">{row.entrySpotPrice.toLocaleString('en-IN')}</TableCell>
-      <TableCell className="text-right tabular-nums text-bearish">{row.stopLossSpot.toLocaleString('en-IN')}</TableCell>
+      <TableCell className="text-right tabular-nums">
+        <span
+          className={cn(
+            'inline-flex items-center justify-end gap-1',
+            row.trailStage === 'NONE' ? 'text-bearish' : row.trailStage === 'BREAKEVEN' ? 'text-amber-400' : 'text-emerald-500',
+          )}
+          title={
+            row.trailStage === 'NONE'
+              ? 'Original entry-time risk stop'
+              : row.trailStage === 'BREAKEVEN'
+                ? 'Trailed to breakeven — this trade can no longer lose money'
+                : 'Trailed to lock in guaranteed profit'
+          }
+        >
+          {row.trailStage !== 'NONE' && (row.trailStage === 'BREAKEVEN' ? <Shield className="h-3 w-3" /> : <ShieldCheck className="h-3 w-3" />)}
+          {row.stopLossSpot.toLocaleString('en-IN')}
+        </span>
+      </TableCell>
       <TableCell className="text-right tabular-nums text-bullish">{row.targetSpot.toLocaleString('en-IN')}</TableCell>
       <TableCell className="text-right">
         {row.currentStatus === 'ACTIVE' && livePrice !== null ? (

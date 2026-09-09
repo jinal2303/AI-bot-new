@@ -18,6 +18,8 @@ const badgeVariants = cva(
         active: 'animate-pulse border-transparent bg-amber-400 text-amber-950',
         target: 'border-transparent bg-emerald-500 text-emerald-950',
         stoploss: 'border-transparent bg-red-800 text-red-50',
+        trailstop: 'border-transparent bg-sky-500 text-sky-950',
+        timeexit: 'border-transparent bg-slate-500 text-slate-50',
       },
     },
     defaultVariants: {

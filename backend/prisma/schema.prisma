@@ -23,17 +23,35 @@ enum ExpiryType {
 enum TradeStatus {
   ACTIVE
   TARGET_HIT
+  /// The position's *original* entry-time stop-loss was hit — trailStage
+  /// was still NONE, i.e. the stop had never been moved into profit.
   STOPLOSS_HIT
-  /// Not yet used by application code — reserved for a time-based force-
-  /// exit ("if neither target nor stop-loss hits within N minutes, close
-  /// at market"). Declared here only to match a migration already applied
-  /// to this database; keeping schema.prisma in sync with real DB state.
+  /// A trailing stop was hit instead of the original risk stop — trailStage
+  /// was BREAKEVEN or PROFIT_LOCK, so this exit is a locked-in win (or a
+  /// scratch at breakeven), not a loss. See PositionMonitorService.
+  TRAIL_STOP_HIT
+  /// Forced market exit after STALE_EXIT_MINUTES: the position was in
+  /// profit but stalled (never reached target) and then gave back most of
+  /// that favorable move. See PositionMonitorService.applyStaleExitRule().
   TIME_EXIT
 }
 
 enum TargetBasis {
   PIVOT
   ATR
+}
+
+/// Progression of the dynamic trailing stop-loss for one position — strictly
+/// one-directional (never regresses) as favorable price movement deepens.
+enum TrailStage {
+  /// stopLossSpot is still the original entry-time risk stop.
+  NONE
+  /// Favorable move reached 1x ATR(14) — stopLossSpot pulled to breakeven
+  /// (entrySpotPrice), so the trade can no longer lose money.
+  BREAKEVEN
+  /// Favorable move reached 1.5x ATR(14) — stopLossSpot pulled to lock in
+  /// 0.75x ATR(14) of guaranteed profit.
+  PROFIT_LOCK
 }
 
 /// One generated trading signal — a persisted, monitored position from
@@ -80,6 +98,17 @@ model TradeSignal {
   /// or a symmetric ATR distance — see SignalsService.resolveTargetPoints().
   /// Nullable only for rows from before this field existed.
   targetBasis    TargetBasis?
+  /// How far the dynamic trailing stop-loss has progressed. `stopLossSpot`
+  /// itself is always the live, current stop (ratcheted, never loosened) —
+  /// this just records *why* it's where it is, for display and so a hit on
+  /// it resolves to TRAIL_STOP_HIT instead of STOPLOSS_HIT. See
+  /// PositionMonitorService.applyTrailingStop().
+  trailStage     TrailStage   @default(NONE)
+  /// Whether the one-time stale-position target reduction (30% tighter,
+  /// after STALE_EXIT_MINUTES in profit with no target hit) has already
+  /// fired for this position — guards against re-shrinking it every tick.
+  /// See PositionMonitorService.applyStaleExitRule().
+  staleAdjusted  Boolean      @default(false)
 
   // --- Indexes -------------------------------------------------------------
   // dateString:               daily-throttle COUNT and GET /signals/today

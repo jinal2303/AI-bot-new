@@ -1,9 +1,17 @@
 'use client';
 
 import { useEffect } from 'react';
-import { Target, ShieldAlert, X } from 'lucide-react';
+import { Clock, ShieldAlert, ShieldCheck, Target, X } from 'lucide-react';
 import { ExitToastItem } from '@/hooks/use-trade-socket';
 import { cn } from '@/lib/utils';
+
+const EXIT_COPY: Record<ExitToastItem['signal']['currentStatus'], { title: string; icon: typeof Target }> = {
+  ACTIVE: { title: 'POSITION UPDATE', icon: Target }, // never actually rendered (toasts only fire on resolution) — exhaustiveness only.
+  TARGET_HIT: { title: '🎯 TARGET ACHIEVED!', icon: Target },
+  TRAIL_STOP_HIT: { title: '🛡️ TRAILING STOP HIT', icon: ShieldCheck },
+  STOPLOSS_HIT: { title: '⚠️ STOP-LOSS TRIGGERED', icon: ShieldAlert },
+  TIME_EXIT: { title: '⏱️ TIME-DECAY EXIT', icon: Clock },
+};
 
 interface ExitToastStackProps {
   toasts: ExitToastItem[];
@@ -26,7 +34,11 @@ export function ExitToastStack({ toasts, onDismiss }: ExitToastStackProps) {
 }
 
 function ExitToastCard({ toast, onDismiss }: { toast: ExitToastItem; onDismiss: (toastId: string) => void }) {
-  const isWin = toast.signal.currentStatus === 'TARGET_HIT';
+  // "Win" styling is by realized P&L sign, not a hardcoded status — a
+  // TRAIL_STOP_HIT is always a locked-in win/scratch, and a TIME_EXIT can
+  // land on either side of entry.
+  const isWin = toast.netCashINR >= 0;
+  const { title, icon: Icon } = EXIT_COPY[toast.signal.currentStatus];
 
   useEffect(() => {
     const timer = window.setTimeout(() => onDismiss(toast.toastId), AUTO_DISMISS_MS);
@@ -47,12 +59,10 @@ function ExitToastCard({ toast, onDismiss }: { toast: ExitToastItem; onDismiss: 
             isWin ? 'bg-emerald-500/15 text-emerald-500' : 'bg-red-700/15 text-red-500',
           )}
         >
-          {isWin ? <Target className="h-5 w-5" /> : <ShieldAlert className="h-5 w-5" />}
+          <Icon className="h-5 w-5" />
         </div>
         <div className="min-w-0 flex-1">
-          <p className={cn('font-semibold', isWin ? 'text-emerald-500' : 'text-red-500')}>
-            {isWin ? '🎯 TARGET ACHIEVED!' : '⚠️ STOP-LOSS TRIGGERED'}
-          </p>
+          <p className={cn('font-semibold', isWin ? 'text-emerald-500' : 'text-red-500')}>{title}</p>
           <p className="mt-0.5 text-sm text-muted-foreground">
             NIFTY {toast.signal.strikePrice} {toast.signal.direction === 'CALL' ? 'CE' : 'PE'} · exit spot{' '}
             {toast.livePrice.toLocaleString('en-IN')}

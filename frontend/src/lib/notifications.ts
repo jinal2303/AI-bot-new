@@ -76,13 +76,23 @@ export function notifyNewEntry(signal: TradeSignal, risk: RiskConfig): void {
   }
 }
 
+const EXIT_TITLES: Record<TradeSignal['currentStatus'], string> = {
+  ACTIVE: '', // unused — notifyExit only ever fires on a resolved status
+  TARGET_HIT: '🎯 TARGET ACHIEVED!',
+  TRAIL_STOP_HIT: '🛡️ TRAILING STOP HIT',
+  STOPLOSS_HIT: '⚠️ STOP-LOSS TRIGGERED',
+  TIME_EXIT: '⏱️ TIME-DECAY EXIT',
+};
+
 /**
- * Fires the live exit popup for a position the backend just resolved as
- * TARGET_HIT or STOPLOSS_HIT, with a distinct win/loss audio chime
- * alongside the native OS notification sound.
+ * Fires the live exit popup for a position the backend just resolved
+ * (TARGET_HIT, TRAIL_STOP_HIT, STOPLOSS_HIT, or TIME_EXIT), with a distinct
+ * win/loss audio chime alongside the native OS notification sound.
  */
 export function notifyExit(signal: TradeSignal, netCashINR: number): void {
-  const isWin = signal.currentStatus === 'TARGET_HIT';
+  // By realized P&L sign, not a hardcoded status — TRAIL_STOP_HIT is always
+  // a locked-in win/scratch, and TIME_EXIT can land on either side of entry.
+  const isWin = netCashINR >= 0;
 
   // The audio chime plays regardless of Notification permission — it's an
   // in-tab cue, not dependent on OS-level permission grants.
@@ -98,10 +108,10 @@ export function notifyExit(signal: TradeSignal, netCashINR: number): void {
 
   try {
     const label = optionLabel(signal.direction);
-    const title = isWin ? '🎯 TARGET ACHIEVED!' : '⚠️ STOP-LOSS TRIGGERED';
+    const title = EXIT_TITLES[signal.currentStatus];
     const body = isWin
-      ? `NIFTY ${signal.strikePrice} ${label} hit profit target! Net: +₹${netCashINR.toLocaleString('en-IN')} per lot.`
-      : `NIFTY ${signal.strikePrice} ${label} exited at protection risk limit. Net: -₹${Math.abs(netCashINR).toLocaleString('en-IN')} per lot.`;
+      ? `NIFTY ${signal.strikePrice} ${label} closed in profit (${signal.currentStatus}). Net: +₹${netCashINR.toLocaleString('en-IN')} per lot.`
+      : `NIFTY ${signal.strikePrice} ${label} closed at a loss (${signal.currentStatus}). Net: -₹${Math.abs(netCashINR).toLocaleString('en-IN')} per lot.`;
 
     const notification = new Notification(title, {
       body,
