@@ -152,6 +152,7 @@ export class IndicatorsService {
     return {
       dayHigh,
       dayLow,
+      prevClose,
       pivot,
       resistance1: 2 * pivot - prevLow,
       resistance2: pivot + range,

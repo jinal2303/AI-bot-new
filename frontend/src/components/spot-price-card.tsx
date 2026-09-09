@@ -35,22 +35,25 @@ export function SpotPriceCard({ signal, isLoading }: SpotPriceCardProps) {
         {isLoading && !signal ? (
           <div className="h-12 w-48 animate-pulse rounded-md bg-muted" />
         ) : (
-          <div className="flex items-baseline gap-3">
+          <>
             <span className="text-5xl font-bold tracking-tight tabular-nums">
               {signal ? signal.spot.toLocaleString('en-IN', { maximumFractionDigits: 2 }) : '—'}
             </span>
-            {isAboveSma !== null && (
-              <span
-                className={cn(
-                  'flex items-center gap-1 text-sm font-medium',
-                  isAboveSma ? 'text-bullish' : 'text-bearish',
-                )}
-              >
-                {isAboveSma ? <TrendingUp className="h-4 w-4" /> : <TrendingDown className="h-4 w-4" />}
-                {isAboveSma ? 'Above SMA(9)' : 'Below SMA(9)'}
-              </span>
-            )}
-          </div>
+            <div className="mt-1.5 flex flex-wrap items-center gap-3">
+              {signal && <DayChangeStat dayChange={signal.dayChange} dayChangePercent={signal.dayChangePercent} />}
+              {isAboveSma !== null && (
+                <span
+                  className={cn(
+                    'flex items-center gap-1 text-sm font-medium',
+                    isAboveSma ? 'text-bullish' : 'text-bearish',
+                  )}
+                >
+                  {isAboveSma ? <TrendingUp className="h-4 w-4" /> : <TrendingDown className="h-4 w-4" />}
+                  {isAboveSma ? 'Above SMA(9)' : 'Below SMA(9)'}
+                </span>
+              )}
+            </div>
+          </>
         )}
 
         <div className="mt-6 grid grid-cols-2 gap-4 border-t border-border pt-4 sm:grid-cols-4">
@@ -89,6 +92,20 @@ export function SpotPriceCard({ signal, isLoading }: SpotPriceCardProps) {
       </CardContent>
       <Activity className="pointer-events-none absolute -bottom-6 -right-6 h-32 w-32 text-primary/5" />
     </Card>
+  );
+}
+
+function DayChangeStat({ dayChange, dayChangePercent }: { dayChange: number; dayChangePercent: number }) {
+  const isUp = dayChange >= 0;
+  const sign = isUp ? '+' : '-';
+
+  return (
+    <span className={cn('flex items-center gap-1 text-sm font-semibold tabular-nums', isUp ? 'text-bullish' : 'text-bearish')}>
+      {isUp ? <TrendingUp className="h-4 w-4" /> : <TrendingDown className="h-4 w-4" />}
+      {sign}
+      {Math.abs(dayChange).toLocaleString('en-IN', { maximumFractionDigits: 2 })} ({sign}
+      {Math.abs(dayChangePercent).toFixed(2)}%) today
+    </span>
   );
 }
 

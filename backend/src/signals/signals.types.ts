@@ -48,6 +48,8 @@ export interface SeriesPoint {
 export interface DailyLevels {
   dayHigh: number;
   dayLow: number;
+  /** Previous trading session's closing price — the baseline for today's change. */
+  prevClose: number;
   /** (prevHigh + prevLow + prevClose) / 3 */
   pivot: number;
   resistance1: number;
@@ -107,6 +109,10 @@ export interface SignalData {
   generatedAt: string;
   symbol: string;
   spot: number;
+  /** spot - dailyLevels.prevClose */
+  dayChange: number;
+  /** dayChange / dailyLevels.prevClose x 100 */
+  dayChangePercent: number;
   sma9: number;
   rsi14: number;
   atr14: number;

@@ -33,6 +33,8 @@ export interface ExpiryInfo {
 export interface DailyLevels {
   dayHigh: number;
   dayLow: number;
+  /** Previous trading session's closing price — the baseline for today's change. */
+  prevClose: number;
   pivot: number;
   resistance1: number;
   resistance2: number;
@@ -64,6 +66,10 @@ export interface SignalData {
   generatedAt: string;
   symbol: string;
   spot: number;
+  /** spot - dailyLevels.prevClose */
+  dayChange: number;
+  /** dayChange / dailyLevels.prevClose x 100 */
+  dayChangePercent: number;
   sma9: number;
   rsi14: number;
   atr14: number;

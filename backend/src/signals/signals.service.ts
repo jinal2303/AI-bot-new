@@ -192,11 +192,16 @@ export class SignalsService {
       const id = isSameSignalEvent ? this.latestSignal!.id : randomUUID();
       const generatedAt = isSameSignalEvent ? this.latestSignal!.generatedAt : new Date().toISOString();
 
+      const dayChange = this.round(snapshot.spot - dailyLevels.prevClose);
+      const dayChangePercent = this.round((dayChange / dailyLevels.prevClose) * 100);
+
       this.latestSignal = {
         id,
         generatedAt,
         symbol: this.symbol,
         spot: this.round(snapshot.spot),
+        dayChange,
+        dayChangePercent,
         sma9: this.round(snapshot.sma9),
         rsi14: this.round(snapshot.rsi14),
         atr14: this.round(snapshot.atr14),
@@ -351,6 +356,8 @@ export class SignalsService {
       generatedAt: new Date().toISOString(),
       symbol: this.symbol,
       spot: 0,
+      dayChange: 0,
+      dayChangePercent: 0,
       sma9: 0,
       rsi14: 0,
       atr14: 0,
@@ -361,7 +368,7 @@ export class SignalsService {
       tradeRules: null,
       marketOpen: isIndianMarketOpen(),
       series: [],
-      dailyLevels: { dayHigh: 0, dayLow: 0, pivot: 0, resistance1: 0, resistance2: 0, support1: 0, support2: 0 },
+      dailyLevels: { dayHigh: 0, dayLow: 0, prevClose: 0, pivot: 0, resistance1: 0, resistance2: 0, support1: 0, support2: 0 },
       dailySignalCount,
       maxDailySignals: this.maxDailySignals,
       dailyLimitReached,
