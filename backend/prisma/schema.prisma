@@ -24,6 +24,11 @@ enum TradeStatus {
   ACTIVE
   TARGET_HIT
   STOPLOSS_HIT
+  /// Not yet used by application code — reserved for a time-based force-
+  /// exit ("if neither target nor stop-loss hits within N minutes, close
+  /// at market"). Declared here only to match a migration already applied
+  /// to this database; keeping schema.prisma in sync with real DB state.
+  TIME_EXIT
 }
 
 enum TargetBasis {
@@ -55,6 +60,12 @@ model TradeSignal {
   /// When/where the position was resolved by the 10s monitor (null while ACTIVE).
   resolvedAt     DateTime?   @db.Timestamptz(3)
   resolvedSpot   Float?
+  /// Realized cash P&L for 1 lot at resolution — |resolvedSpot - entrySpotPrice|
+  /// x DELTA_PROXY x LOT_SIZE, positive for TARGET_HIT, negative for
+  /// STOPLOSS_HIT. Persisted (not recomputed later) so it reflects the
+  /// actual desk config at the time of the trade, immune to those constants
+  /// changing afterward. Null while ACTIVE.
+  netCashINR     Float?
   /// The most favorable spot price seen since entry (highest for a CALL,
   /// lowest for a PUT) — updated by the 10s position monitor every tick it
   /// improves. Null until the first tick after creation. The frontend

@@ -83,17 +83,19 @@ export class TradesService {
 
   /**
    * Flips a position to TARGET_HIT / STOPLOSS_HIT, recording the resolving
-   * spot price and the final peak-favorable price in one write.
+   * spot price, the final peak-favorable price, and the realized cash P&L
+   * in one write.
    */
   async resolvePosition(
     id: string,
     status: typeof TradeStatus.TARGET_HIT | typeof TradeStatus.STOPLOSS_HIT,
     resolvedSpot: number,
     peakSpot: number,
+    netCashINR: number,
   ): Promise<TradeSignal> {
     return this.prisma.tradeSignal.update({
       where: { id },
-      data: { currentStatus: status, resolvedAt: new Date(), resolvedSpot, peakSpot },
+      data: { currentStatus: status, resolvedAt: new Date(), resolvedSpot, peakSpot, netCashINR },
     });
   }
 

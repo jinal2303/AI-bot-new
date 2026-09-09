@@ -1,7 +1,7 @@
-import { ArrowDownRight, ArrowUpRight, TrendingUp } from 'lucide-react';
+import { ArrowDownRight, ArrowUpRight, Timer, TrendingUp } from 'lucide-react';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { StatusBadge } from '@/components/status-badge';
-import { peakPoints, TradeSignal } from '@/lib/trade-signal';
+import { formatDuration, holdDurationMs, peakPoints, TradeSignal } from '@/lib/trade-signal';
 import { cn } from '@/lib/utils';
 
 interface SignalsTableProps {
@@ -30,7 +30,9 @@ export function SignalsTable({ signals, emptyMessage }: SignalsTableProps) {
           <TableHead className="text-right">Stop-Loss</TableHead>
           <TableHead className="text-right">Target</TableHead>
           <TableHead className="text-right">Peak Pts</TableHead>
+          <TableHead>Duration</TableHead>
           <TableHead>Status</TableHead>
+          <TableHead className="text-right">Net P&amp;L</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -85,7 +87,28 @@ function SignalRow({ row }: { row: TradeSignal }) {
         )}
       </TableCell>
       <TableCell>
+        <span className={cn('flex items-center gap-1 tabular-nums', row.currentStatus === 'ACTIVE' ? 'text-amber-400' : 'text-muted-foreground')}>
+          <Timer className="h-3 w-3" />
+          {formatDuration(holdDurationMs(row))}
+          {row.currentStatus === 'ACTIVE' && <span className="text-muted-foreground">…</span>}
+        </span>
+      </TableCell>
+      <TableCell>
         <StatusBadge status={row.currentStatus} />
+      </TableCell>
+      <TableCell className="text-right">
+        {row.netCashINR !== null ? (
+          <span
+            className={cn(
+              'font-semibold tabular-nums',
+              row.netCashINR >= 0 ? 'text-emerald-500' : 'text-red-500',
+            )}
+          >
+            {row.netCashINR >= 0 ? '+' : '-'}₹{Math.abs(row.netCashINR).toLocaleString('en-IN')}
+          </span>
+        ) : (
+          <span className="text-muted-foreground">—</span>
+        )}
       </TableCell>
     </TableRow>
   );

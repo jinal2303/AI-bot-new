@@ -23,7 +23,7 @@ export default function ArchivePage() {
   const rangeEnd = Math.min(offset + limit, total);
 
   return (
-    <main className="container max-w-6xl py-10">
+    <main className="container max-w-screen-2xl py-10">
       <header className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">Signal Archive</h1>

@@ -29,12 +29,33 @@ export interface TradeSignal {
   atr14: number | null;
   /** Whether `targetSpot` came from a support/resistance pivot or a symmetric ATR distance. Null for legacy rows predating this field. */
   targetBasis: 'PIVOT' | 'ATR' | null;
+  /** Realized cash P&L for 1 lot at resolution — positive for TARGET_HIT, negative for STOPLOSS_HIT. Null while ACTIVE. */
+  netCashINR: number | null;
 }
 
 /** Peak favorable move, in index points, since entry — null if not yet tracked. */
 export function peakPoints(signal: TradeSignal): number | null {
   if (signal.peakSpot === null) return null;
   return Math.abs(signal.peakSpot - signal.entrySpotPrice);
+}
+
+/** How long the position has been held — entry to resolution, or entry to "now" while still ACTIVE. */
+export function holdDurationMs(signal: TradeSignal): number {
+  const start = new Date(signal.timestamp).getTime();
+  const end = signal.resolvedAt ? new Date(signal.resolvedAt).getTime() : Date.now();
+  return Math.max(0, end - start);
+}
+
+/** Formats a duration as "1h 5m" / "4m 32s" / "32s" — the two biggest units, dropping smaller ones once minutes/hours are in play. */
+export function formatDuration(ms: number): string {
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
 }
 
 /** Query filters accepted by GET /api/signals/archive. */

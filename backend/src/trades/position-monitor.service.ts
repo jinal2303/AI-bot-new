@@ -73,8 +73,8 @@ export class PositionMonitorService {
           continue;
         }
 
-        const updated = await this.tradesService.resolvePosition(position.id, outcome, livePrice, peakSpot);
         const netCashINR = this.computeNetCashINR(outcome, position.entrySpotPrice, livePrice);
+        const updated = await this.tradesService.resolvePosition(position.id, outcome, livePrice, peakSpot, netCashINR);
         this.logger.log(
           `Position ${updated.id} (${updated.direction} ${updated.strikePrice}) resolved → ${outcome} at spot ${livePrice} (₹${netCashINR})`,
         );
