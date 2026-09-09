@@ -283,13 +283,7 @@ export class SignalsService {
     const direction = signal === 'BUY CALL (CE)' ? 1 : -1;
     const indexStopLossPoints = this.round(atr14 * this.atrStopLossMultiplier);
     const atrTargetPoints = this.round(atr14 * this.atrTargetMultiplier);
-    const { indexTargetPoints, targetBasis } = this.resolveTargetPoints(
-      direction,
-      entryPrice,
-      atrTargetPoints,
-      indexStopLossPoints,
-      dailyLevels,
-    );
+    const { indexTargetPoints, targetBasis } = this.resolveTargetPoints(direction, entryPrice, atrTargetPoints, dailyLevels);
 
     const optionTargetPoints = this.round(indexTargetPoints * this.deltaProxy);
     const optionStopLossPoints = this.round(indexStopLossPoints * this.deltaProxy);
@@ -315,20 +309,35 @@ export class SignalsService {
   }
 
   /**
-   * Prefers the nearest support/resistance pivot in the trade's favor as
-   * the target — real supply/demand levels the market has already
-   * respected, from the previous session's pivot points — over a
-   * symmetric ATR distance. Falls back to the ATR target when no pivot
-   * offers at least a 1:1 reward:risk (i.e. it's closer than the
-   * stop-loss distance, so aiming for it wouldn't make a sound trade).
+   * Step 1 — find the nearest support/resistance pivot in the trade's
+   * favorable direction (resistance above entry for a CALL, support below
+   * entry for a PUT); a farther pivot is never relevant since price would
+   * reach the nearer one first.
+   *
+   * Step 2 — `atrTargetPoints` (ATR × ATR_TARGET_MULTIPLIER, default 2×ATR)
+   * is both the fallback target *and* the qualifying bar for the pivot.
+   *
+   * Step 3 — use the pivot as target only when it is at least as far as
+   * atrTargetPoints; otherwise fall back to atrTargetPoints itself. This
+   * guarantees indexTargetPoints is NEVER less than atrTargetPoints,
+   * whichever branch fires — and therefore never below the default 2:1
+   * reward:risk versus indexStopLossPoints (ATR × ATR_STOPLOSS_MULTIPLIER).
+   *
+   * BUGFIX: this previously qualified a pivot against `indexStopLossPoints`
+   * (1×ATR by default) instead of `atrTargetPoints` (2×ATR) — the wrong
+   * yardstick. A pivot sitting anywhere between 1x and 2x ATR away used to
+   * pass that check and get selected as target, silently shipping trades
+   * with as little as ~1:1 reward:risk while believing they were 2:1,
+   * since pivot placement is essentially independent of ATR and this was
+   * the *common* case, not an edge case.
    */
   private resolveTargetPoints(
     direction: 1 | -1,
     entryPrice: number,
     atrTargetPoints: number,
-    indexStopLossPoints: number,
     levels: DailyLevels,
   ): { indexTargetPoints: number; targetBasis: 'PIVOT' | 'ATR' } {
+    // Step 1
     const candidates =
       direction === 1
         ? [levels.resistance1, levels.resistance2].filter((level) => level > entryPrice)
@@ -338,7 +347,9 @@ export class SignalsService {
       const nearestPivot = direction === 1 ? Math.min(...candidates) : Math.max(...candidates);
       const pivotDistance = this.round(Math.abs(nearestPivot - entryPrice));
 
-      if (pivotDistance >= indexStopLossPoints) {
+      // Step 3 — qualify against the ATR TARGET distance, not the
+      // stop-loss distance (see BUGFIX note above).
+      if (pivotDistance >= atrTargetPoints) {
         return { indexTargetPoints: pivotDistance, targetBasis: 'PIVOT' };
       }
     }
