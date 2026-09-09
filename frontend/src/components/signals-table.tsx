@@ -1,7 +1,7 @@
-import { ArrowDownRight, ArrowUpRight, Radio, Timer, TrendingUp } from 'lucide-react';
+import { ArrowDownRight, ArrowUpRight, CalendarClock, Radio, Timer, TrendingUp, Zap } from 'lucide-react';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { StatusBadge } from '@/components/status-badge';
-import { formatDuration, holdDurationMs, liveUnrealizedCashINR, peakPoints, TradeSignal } from '@/lib/trade-signal';
+import { callType, formatDuration, holdDurationMs, liveUnrealizedCashINR, peakPoints, TradeSignal } from '@/lib/trade-signal';
 import { cn } from '@/lib/utils';
 
 interface SignalsTableProps {
@@ -26,6 +26,7 @@ export function SignalsTable({ signals, emptyMessage, livePrice = null }: Signal
         <TableRow>
           <TableHead>Time</TableHead>
           <TableHead>Direction</TableHead>
+          <TableHead>Type</TableHead>
           <TableHead>Strike</TableHead>
           <TableHead>Expiry</TableHead>
           <TableHead className="text-right">Entry</TableHead>
@@ -54,6 +55,8 @@ function SignalRow({ row, livePrice }: { row: TradeSignal; livePrice: number | n
   const targetPoints = Math.abs(row.targetSpot - row.entrySpotPrice);
   const reachedTarget = peak !== null && peak >= targetPoints;
   const livePnl = liveUnrealizedCashINR(row, livePrice);
+  const type = callType(row);
+  const isIntraday = type === 'INTRADAY';
 
   return (
     <TableRow>
@@ -68,6 +71,18 @@ function SignalRow({ row, livePrice }: { row: TradeSignal; livePrice: number | n
         <span className={cn('flex items-center gap-1 font-medium', isCall ? 'text-bullish' : 'text-bearish')}>
           {isCall ? <ArrowUpRight className="h-3.5 w-3.5" /> : <ArrowDownRight className="h-3.5 w-3.5" />}
           {row.direction} ({isCall ? 'CE' : 'PE'})
+        </span>
+      </TableCell>
+      <TableCell>
+        <span
+          className={cn(
+            'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium',
+            isIntraday ? 'bg-sky-500/10 text-sky-400' : 'bg-purple-500/10 text-purple-400',
+          )}
+          title={isIntraday ? 'Entered and (so far) held within the same trading day' : 'Carried over past the entry day — no target/stop-loss hit before market close'}
+        >
+          {isIntraday ? <Zap className="h-3 w-3" /> : <CalendarClock className="h-3 w-3" />}
+          {isIntraday ? 'Intraday' : 'Delivery'}
         </span>
       </TableCell>
       <TableCell className="tabular-nums">{row.strikePrice.toLocaleString('en-IN')}</TableCell>

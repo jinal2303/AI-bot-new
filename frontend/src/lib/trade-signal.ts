@@ -4,6 +4,8 @@
  * GET /api/signals/today and GET /api/signals/archive.
  */
 
+import { SignalData } from '@/lib/types';
+
 export type TradeDirection = 'CALL' | 'PUT';
 
 export type TradeExpiryType = 'CURRENT_WEEK' | 'NEXT_WEEK';
@@ -62,6 +64,112 @@ export function liveUnrealizedCashINR(signal: TradeSignal, livePrice: number | n
   if (signal.currentStatus !== 'ACTIVE' || livePrice === null) return null;
   const favorablePoints = signal.direction === 'CALL' ? livePrice - signal.entrySpotPrice : signal.entrySpotPrice - livePrice;
   return Math.round(favorablePoints * DELTA_PROXY * LOT_SIZE);
+}
+
+export type CallType = 'INTRADAY' | 'DELIVERY';
+
+/** IST calendar date (YYYY-MM-DD) for an ISO instant — matches the format of the backend's `dateString`. */
+function istDateString(iso: string): string {
+  return new Date(iso).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+}
+
+/**
+ * Whether a call was squared off (or, if still open, is running) within the
+ * same IST trading day it was entered on ("INTRADAY"), or has carried past
+ * that day into another session ("DELIVERY") — this bot has no forced
+ * end-of-day square-off, so a signal that never hits its target/stop-loss
+ * before market close simply stays ACTIVE and rolls over. Derived purely
+ * from `dateString` (the entry day) vs. `resolvedAt` (or "now" while
+ * ACTIVE) — no separate field needed.
+ */
+export function callType(signal: TradeSignal): CallType {
+  const referenceIso = signal.resolvedAt ?? new Date().toISOString();
+  return istDateString(referenceIso) === signal.dateString ? 'INTRADAY' : 'DELIVERY';
+}
+
+const MARKET_CLOSE_MINUTES_IST = 15 * 60 + 30; // 15:30 IST
+/** How far ahead of the close a carry/square-off call actually starts being worth making. */
+const CARRY_DECISION_WINDOW_MINUTES = 60;
+
+/** Minutes since IST midnight for `date`, via the browser's own (always-full-ICU) Intl support. */
+function istMinutesSinceMidnight(date: Date): number {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const hour = Number(parts.find((p) => p.type === 'hour')?.value ?? '0');
+  const minute = Number(parts.find((p) => p.type === 'minute')?.value ?? '0');
+  return hour * 60 + minute;
+}
+
+export type CarryAction = 'LEAN_CARRY' | 'LEAN_SQUARE_OFF' | 'ALREADY_CARRIED';
+
+export interface CarryRecommendation {
+  action: CarryAction;
+  headline: string;
+  reason: string;
+}
+
+/**
+ * A heuristic, explainable suggestion — never an instruction the app acts
+ * on itself — for whether an ACTIVE position is worth carrying into the
+ * next session or better squared off before today's close. This bot has no
+ * auto square-off, so a position that never hits target/stop-loss simply
+ * stays open; this just surfaces a read on current market conditions once
+ * the close is actually near, using the same live spot/SMA(9)/RSI(14) the
+ * strategy itself trades off of:
+ *   - trend still aligned with the trade's direction (spot vs SMA9, RSI
+ *     on the right side of 50), and
+ *   - price sitting closer to target than to stop-loss
+ * both leaning toward "worth carrying"; either one failing leans toward
+ * "square off" instead, since overnight/next-session gap risk is added on
+ * top of an already-weakening setup. Returns null outside the decision
+ * window (there's no carry call to make yet — plenty of the day is left).
+ */
+export function carryRecommendation(
+  signal: TradeSignal,
+  live: Pick<SignalData, 'spot' | 'sma9' | 'rsi14' | 'marketOpen'> | null,
+): CarryRecommendation | null {
+  if (signal.currentStatus !== 'ACTIVE' || live === null) return null;
+
+  const minutesToClose = MARKET_CLOSE_MINUTES_IST - istMinutesSinceMidnight(new Date());
+
+  if (!live.marketOpen && minutesToClose <= 0) {
+    return {
+      action: 'ALREADY_CARRIED',
+      headline: 'Carried to the next session',
+      reason:
+        "Market closed with this position still open — it's now effectively a delivery position and will keep tracking against the live spot when trading resumes.",
+    };
+  }
+
+  if (minutesToClose > CARRY_DECISION_WINDOW_MINUTES) {
+    return null; // Plenty of the session left — too early for a carry call.
+  }
+
+  const isCall = signal.direction === 'CALL';
+  const distanceToTarget = Math.abs(signal.targetSpot - live.spot);
+  const distanceToStopLoss = Math.abs(signal.stopLossSpot - live.spot);
+  const trendAligned = isCall ? live.spot > live.sma9 && live.rsi14 >= 50 : live.spot < live.sma9 && live.rsi14 <= 50;
+  const closerToStopLoss = distanceToStopLoss < distanceToTarget;
+
+  if (closerToStopLoss || !trendAligned) {
+    return {
+      action: 'LEAN_SQUARE_OFF',
+      headline: 'Leaning toward squaring off',
+      reason: closerToStopLoss
+        ? `Price is closer to the stop-loss (${distanceToStopLoss.toFixed(1)}pts away) than the target (${distanceToTarget.toFixed(1)}pts away) with the close near — carrying adds overnight gap risk to a setup already trending the wrong way.`
+        : `Spot/SMA(9)/RSI(14) no longer align with this ${signal.direction} — momentum has weakened — closing out avoids holding a fading setup overnight.`,
+    };
+  }
+
+  return {
+    action: 'LEAN_CARRY',
+    headline: "Reasonable to carry if it doesn't resolve today",
+    reason: `Trend still aligns with this ${signal.direction} and price is closer to target (${distanceToTarget.toFixed(1)}pts away) than stop-loss (${distanceToStopLoss.toFixed(1)}pts away) as the close approaches — carrying into the next session is defensible if it doesn't hit target in the next ${minutesToClose}m.`,
+  };
 }
 
 /** How long the position has been held — entry to resolution, or entry to "now" while still ACTIVE. */

@@ -8,6 +8,7 @@ import { NiftyChart } from '@/components/nifty-chart';
 import { NotificationStatus } from '@/components/notification-status';
 import { TodayStats } from '@/components/today-stats';
 import { SignalsTable } from '@/components/signals-table';
+import { CarryAdvisory } from '@/components/carry-advisory';
 import { ExitToastStack } from '@/components/exit-toast';
 import { Nav } from '@/components/nav';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -15,6 +16,7 @@ import { useSignalPolling } from '@/hooks/use-signal-polling';
 import { useTodaySignals } from '@/hooks/use-today-signals';
 import { useTradeSocket } from '@/hooks/use-trade-socket';
 import { RiskConfig } from '@/lib/notifications';
+import { carryRecommendation } from '@/lib/trade-signal';
 
 export default function DashboardPage() {
   const { signal, isLoading, error, lastUpdated, notificationPermission } = useSignalPolling();
@@ -41,6 +43,14 @@ export default function DashboardPage() {
   // `timestamp` is the true "when was this call given" moment (set once, on
   // creation), unlike the /latest snapshot's `generatedAt` which can shift.
   const activeEntry = useMemo(() => todaySignals.find((row) => row.currentStatus === 'ACTIVE') ?? null, [todaySignals]);
+
+  // Only worth recomputing when the active row or the live snapshot changes
+  // (spot/sma9/rsi14/marketOpen) — a 60s cadence is plenty for a suggestion
+  // that only matters in the last hour before close.
+  const carryAdvice = useMemo(
+    () => (activeEntry ? carryRecommendation(activeEntry, signal) : null),
+    [activeEntry, signal],
+  );
 
   return (
     <main className="container max-w-6xl py-10">
@@ -113,6 +123,7 @@ export default function DashboardPage() {
             emptyMessage="No active call right now."
             livePrice={signal?.spot ?? null}
           />
+          <CarryAdvisory recommendation={carryAdvice} />
         </CardContent>
       </Card>
 
