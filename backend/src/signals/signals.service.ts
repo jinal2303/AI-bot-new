@@ -46,6 +46,8 @@ export class SignalsService {
    */
   private readonly atrTargetMultiplier: number;
   private readonly atrStopLossMultiplier: number;
+  /** Minimum target payoff (1 lot) a setup must clear to be taken at all — see the filter in refreshSignal(). */
+  private readonly minTargetCashINR: number;
 
   /** In-memory cache of the most recently computed live snapshot. */
   private latestSignal: SignalData | null = null;
@@ -72,6 +74,7 @@ export class SignalsService {
     this.deltaProxy = Number(this.configService.get<string>('DELTA_PROXY', '0.5'));
     this.atrTargetMultiplier = Number(this.configService.get<string>('ATR_TARGET_MULTIPLIER', '2'));
     this.atrStopLossMultiplier = Number(this.configService.get<string>('ATR_STOPLOSS_MULTIPLIER', '1'));
+    this.minTargetCashINR = Number(this.configService.get<string>('MIN_TARGET_CASH_INR', '1000'));
   }
 
   /**
@@ -140,8 +143,23 @@ export class SignalsService {
       const expiry = this.expiryService.computeExpiryTarget();
       const dailyLevels = this.indicatorsService.computeDailyLevels(candles);
 
-      const { signal, optionType } = this.evaluateStrategy(snapshot.spot, snapshot.sma9, snapshot.rsi14);
-      const tradeRules = this.buildTradeRules(signal, snapshot.spot, snapshot.atr14, dailyLevels);
+      let { signal, optionType } = this.evaluateStrategy(snapshot.spot, snapshot.sma9, snapshot.rsi14);
+      let tradeRules = this.buildTradeRules(signal, snapshot.spot, snapshot.atr14, dailyLevels);
+
+      // --- Minimum-profit filter ------------------------------------------
+      // A setup that technically clears the RSI/SMA/R:R bars but only pays
+      // out a small amount (thin ATR, target capped by a nearby pivot) may
+      // not be worth the fixed 1-lot brokerage/slippage overhead. Downgrade
+      // it to NO_SIGNAL rather than take it — same as any other disqualified
+      // read, so it never reaches the trade-creation step below.
+      if (tradeRules !== null && tradeRules.targetCashINR < this.minTargetCashINR) {
+        this.logger.debug(
+          `Signal downgraded to NO_SIGNAL — target payoff ₹${tradeRules.targetCashINR} is below the ₹${this.minTargetCashINR} minimum`,
+        );
+        signal = 'NO_SIGNAL';
+        optionType = null;
+        tradeRules = null;
+      }
 
       // --- Persist a new position, if this tick actually opens one -------
       // Only when the strategy is actionable AND nothing is already being

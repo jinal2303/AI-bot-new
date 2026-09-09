@@ -9,7 +9,6 @@ import { NotificationStatus } from '@/components/notification-status';
 import { TodayStats } from '@/components/today-stats';
 import { SignalsTable } from '@/components/signals-table';
 import { ExitToastStack } from '@/components/exit-toast';
-import { NewsPanel } from '@/components/news-panel';
 import { Nav } from '@/components/nav';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { useSignalPolling } from '@/hooks/use-signal-polling';
@@ -102,18 +101,18 @@ export default function DashboardPage() {
         <NiftyChart series={signal?.series ?? []} tradeRules={signal?.tradeRules ?? null} />
       </div>
 
-      <div className="mt-6">
-        <NewsPanel />
-      </div>
-
       <Card className="mt-6">
         <CardHeader>
           <CardTitle className="text-sm font-medium text-muted-foreground">
-            TODAY&apos;S SIGNALS
+            ACTIVE CALL
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <SignalsTable signals={todaySignals} emptyMessage="No signals generated yet today." />
+          <SignalsTable
+            signals={activeEntry ? [activeEntry] : []}
+            emptyMessage="No active call right now."
+            livePrice={signal?.spot ?? null}
+          />
         </CardContent>
       </Card>
 

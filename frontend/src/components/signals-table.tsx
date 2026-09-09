@@ -1,15 +1,17 @@
-import { ArrowDownRight, ArrowUpRight, Timer, TrendingUp } from 'lucide-react';
+import { ArrowDownRight, ArrowUpRight, Radio, Timer, TrendingUp } from 'lucide-react';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { StatusBadge } from '@/components/status-badge';
-import { formatDuration, holdDurationMs, peakPoints, TradeSignal } from '@/lib/trade-signal';
+import { formatDuration, holdDurationMs, liveUnrealizedCashINR, peakPoints, TradeSignal } from '@/lib/trade-signal';
 import { cn } from '@/lib/utils';
 
 interface SignalsTableProps {
   signals: TradeSignal[];
   emptyMessage: string;
+  /** Latest polled Nifty spot price, used to estimate live unrealized P&L on the ACTIVE row. Omit (or null) where no live price is available — e.g. the Archive page, which is purely historical. */
+  livePrice?: number | null;
 }
 
-export function SignalsTable({ signals, emptyMessage }: SignalsTableProps) {
+export function SignalsTable({ signals, emptyMessage, livePrice = null }: SignalsTableProps) {
   if (signals.length === 0) {
     return (
       <div className="flex h-32 items-center justify-center rounded-md border border-dashed border-border text-sm text-muted-foreground">
@@ -29,26 +31,29 @@ export function SignalsTable({ signals, emptyMessage }: SignalsTableProps) {
           <TableHead className="text-right">Entry</TableHead>
           <TableHead className="text-right">Stop-Loss</TableHead>
           <TableHead className="text-right">Target</TableHead>
+          <TableHead className="text-right">Current</TableHead>
           <TableHead className="text-right">Peak Pts</TableHead>
           <TableHead>Duration</TableHead>
           <TableHead>Status</TableHead>
+          <TableHead className="text-right">Live P&amp;L</TableHead>
           <TableHead className="text-right">Net P&amp;L</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
         {signals.map((row) => (
-          <SignalRow key={row.id} row={row} />
+          <SignalRow key={row.id} row={row} livePrice={livePrice} />
         ))}
       </TableBody>
     </Table>
   );
 }
 
-function SignalRow({ row }: { row: TradeSignal }) {
+function SignalRow({ row, livePrice }: { row: TradeSignal; livePrice: number | null }) {
   const isCall = row.direction === 'CALL';
   const peak = peakPoints(row);
   const targetPoints = Math.abs(row.targetSpot - row.entrySpotPrice);
   const reachedTarget = peak !== null && peak >= targetPoints;
+  const livePnl = liveUnrealizedCashINR(row, livePrice);
 
   return (
     <TableRow>
@@ -73,6 +78,25 @@ function SignalRow({ row }: { row: TradeSignal }) {
       <TableCell className="text-right tabular-nums text-bearish">{row.stopLossSpot.toLocaleString('en-IN')}</TableCell>
       <TableCell className="text-right tabular-nums text-bullish">{row.targetSpot.toLocaleString('en-IN')}</TableCell>
       <TableCell className="text-right">
+        {row.currentStatus === 'ACTIVE' && livePrice !== null ? (
+          <span
+            className={cn(
+              'inline-flex items-center justify-end gap-1 font-semibold tabular-nums',
+              (isCall ? livePrice >= row.entrySpotPrice : livePrice <= row.entrySpotPrice)
+                ? 'text-emerald-500'
+                : 'text-red-500',
+            )}
+          >
+            <Radio className="h-3 w-3 animate-pulse" />
+            {livePrice.toLocaleString('en-IN')}
+          </span>
+        ) : (
+          <span className="text-muted-foreground">
+            {row.resolvedSpot !== null ? row.resolvedSpot.toLocaleString('en-IN') : '—'}
+          </span>
+        )}
+      </TableCell>
+      <TableCell className="text-right">
         {peak !== null ? (
           <span
             className={cn(
@@ -95,6 +119,21 @@ function SignalRow({ row }: { row: TradeSignal }) {
       </TableCell>
       <TableCell>
         <StatusBadge status={row.currentStatus} />
+      </TableCell>
+      <TableCell className="text-right">
+        {livePnl !== null ? (
+          <span
+            className={cn(
+              'inline-flex items-center justify-end gap-1 tabular-nums',
+              livePnl >= 0 ? 'text-emerald-500' : 'text-red-500',
+            )}
+          >
+            <Radio className="h-3 w-3 animate-pulse" />
+            {livePnl >= 0 ? '+' : '-'}₹{Math.abs(livePnl).toLocaleString('en-IN')}
+          </span>
+        ) : (
+          <span className="text-muted-foreground">—</span>
+        )}
       </TableCell>
       <TableCell className="text-right">
         {row.netCashINR !== null ? (

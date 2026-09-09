@@ -39,6 +39,31 @@ export function peakPoints(signal: TradeSignal): number | null {
   return Math.abs(signal.peakSpot - signal.entrySpotPrice);
 }
 
+/**
+ * Risk-protocol constants mirrored from the backend's LOT_SIZE/DELTA_PROXY
+ * defaults (see backend/.env) — the frontend already assumes these are
+ * effectively fixed (the dashboard footer states "1 lot, 65 units, Δ 0.5
+ * proxy" outright). Used only to estimate live unrealized P&L for an ACTIVE
+ * position client-side; every *realized* figure (`netCashINR`) is computed
+ * and persisted by the backend itself, never by this constant.
+ */
+export const LOT_SIZE = 65;
+export const DELTA_PROXY = 0.5;
+
+/**
+ * Approx unrealized cash P&L (1 lot) for an ACTIVE position at the given
+ * live spot price — the same formula the backend applies at resolution (see
+ * position-monitor.service.ts `computeNetCashINR`), just evaluated before
+ * the target/stop-loss boundary has actually been crossed. Signed by
+ * whether the move so far favors the position, not by an exit outcome.
+ * Null when the position isn't ACTIVE or no live price is available yet.
+ */
+export function liveUnrealizedCashINR(signal: TradeSignal, livePrice: number | null): number | null {
+  if (signal.currentStatus !== 'ACTIVE' || livePrice === null) return null;
+  const favorablePoints = signal.direction === 'CALL' ? livePrice - signal.entrySpotPrice : signal.entrySpotPrice - livePrice;
+  return Math.round(favorablePoints * DELTA_PROXY * LOT_SIZE);
+}
+
 /** How long the position has been held — entry to resolution, or entry to "now" while still ACTIVE. */
 export function holdDurationMs(signal: TradeSignal): number {
   const start = new Date(signal.timestamp).getTime();
