@@ -23,3 +23,15 @@ export function isIndianMarketOpen(date: Date = new Date()): boolean {
 
   return isWeekday && isTradingWindow;
 }
+
+/**
+ * Minutes remaining until the 15:30 IST close (negative once past it) —
+ * lets a caller derive its own "N minutes before close" cutoff (e.g. the
+ * position monitor's mandatory EOD square-off) directly off the single
+ * source of truth for the close time, instead of hardcoding a second clock
+ * that could drift out of sync if the exchange ever revises market hours.
+ */
+export function minutesUntilMarketClose(date: Date = new Date()): number {
+  const { hour, minute } = getISTDateParts(date);
+  return MARKET_CLOSE_MINUTES - (hour * 60 + minute);
+}

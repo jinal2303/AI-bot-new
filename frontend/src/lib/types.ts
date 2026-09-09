@@ -84,5 +84,10 @@ export interface SignalData {
   dailySignalCount: number;
   maxDailySignals: number;
   dailyLimitReached: boolean;
+  /** Daily loss circuit breaker — count of today's signals resolved STOPLOSS_HIT (TRAIL_STOP_HIT/TIME_EXIT don't count). */
+  stoplossHitCount: number;
+  maxDailyStoplossHits: number;
+  /** True once stoplossHitCount >= maxDailyStoplossHits — halts signal generation for the rest of the day. */
+  lossCircuitBreakerTripped: boolean;
   hasActivePosition: boolean;
 }

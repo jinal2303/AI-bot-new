@@ -3,8 +3,10 @@ import { OnEvent } from '@nestjs/event-emitter';
 import { WebSocketGateway, WebSocketServer } from '@nestjs/websockets';
 import { Server } from 'socket.io';
 import {
+  TARGET_MILESTONE_EVENT,
   TRADE_CREATED_EVENT,
   TRADE_STATUS_CHANGED_EVENT,
+  TargetMilestonePayload,
   TradeCreatedPayload,
   TradeStatusChangedPayload,
 } from '../trades/trade-events';
@@ -16,9 +18,10 @@ const allowedOrigins = (process.env.CORS_ORIGIN ?? 'http://localhost:3000')
 /**
  * Pushes live trade lifecycle events to every connected dashboard the
  * instant they happen — a fresh signal the moment the 60s strategy tick
- * persists one, and a position-status change (TARGET_HIT / STOPLOSS_HIT)
- * the instant the 10s position monitor detects it. No polling delay for
- * either the entry-alert or the exit-popup engine on the frontend.
+ * persists one, a target-progress milestone the moment the 10s position
+ * monitor crosses one, and a position-status change (TARGET_HIT /
+ * TRAIL_STOP_HIT / STOPLOSS_HIT / TIME_EXIT) the instant it resolves. No
+ * polling delay for any of the frontend's live-alert engines.
  */
 @WebSocketGateway({ cors: { origin: allowedOrigins } })
 export class SignalsGateway {
@@ -38,8 +41,15 @@ export class SignalsGateway {
   @OnEvent(TRADE_STATUS_CHANGED_EVENT)
   handleStatusChanged(payload: TradeStatusChangedPayload): void {
     this.logger.log(
-      `Broadcasting status change — ${payload.signal.id} → ${payload.signal.currentStatus}`,
+      `Broadcasting status change — ${payload.signal.id} → ${payload.signal.currentStatus}${payload.reason ? ` (${payload.reason})` : ''}`,
     );
     this.server.emit('signal-status-changed', payload);
+  }
+
+  /** Re-broadcasts a newly-crossed target-progress milestone over the 'signal-target-milestone' socket channel. */
+  @OnEvent(TARGET_MILESTONE_EVENT)
+  handleTargetMilestone(payload: TargetMilestonePayload): void {
+    this.logger.log(`Broadcasting target milestone — ${payload.signal.id} reached ${payload.milestonePct}%`);
+    this.server.emit('signal-target-milestone', payload);
   }
 }

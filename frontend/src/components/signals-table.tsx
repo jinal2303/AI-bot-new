@@ -1,7 +1,7 @@
 import { ArrowDownRight, ArrowUpRight, CalendarClock, Radio, Shield, ShieldCheck, Timer, TrendingUp, Zap } from 'lucide-react';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { StatusBadge } from '@/components/status-badge';
-import { callType, formatDuration, holdDurationMs, liveUnrealizedCashINR, peakPoints, TradeSignal } from '@/lib/trade-signal';
+import { callType, formatDuration, holdDurationMs, liveUnrealizedCashINR, peakOptionPoints, peakPoints, TradeSignal } from '@/lib/trade-signal';
 import { cn } from '@/lib/utils';
 
 interface SignalsTableProps {
@@ -33,7 +33,8 @@ export function SignalsTable({ signals, emptyMessage, livePrice = null }: Signal
           <TableHead className="text-right">Stop-Loss</TableHead>
           <TableHead className="text-right">Target</TableHead>
           <TableHead className="text-right">Current</TableHead>
-          <TableHead className="text-right">Peak Pts</TableHead>
+          <TableHead className="text-right">Peak Pts (Nifty)</TableHead>
+          <TableHead className="text-right">Peak Pts (CE/PE)</TableHead>
           <TableHead>Duration</TableHead>
           <TableHead>Status</TableHead>
           <TableHead className="text-right">Live P&amp;L</TableHead>
@@ -52,6 +53,7 @@ export function SignalsTable({ signals, emptyMessage, livePrice = null }: Signal
 function SignalRow({ row, livePrice }: { row: TradeSignal; livePrice: number | null }) {
   const isCall = row.direction === 'CALL';
   const peak = peakPoints(row);
+  const optionPeak = peakOptionPoints(row);
   const targetPoints = Math.abs(row.targetSpot - row.entrySpotPrice);
   const reachedTarget = peak !== null && peak >= targetPoints;
   const livePnl = liveUnrealizedCashINR(row, livePrice);
@@ -137,6 +139,21 @@ function SignalRow({ row, livePrice }: { row: TradeSignal; livePrice: number | n
             )}
           >
             <TrendingUp className="h-3 w-3" />+{peak.toFixed(1)}
+          </span>
+        ) : (
+          <span className="text-muted-foreground">—</span>
+        )}
+      </TableCell>
+      <TableCell className="text-right">
+        {optionPeak !== null ? (
+          <span
+            className={cn(
+              'inline-flex items-center gap-1 tabular-nums',
+              reachedTarget ? 'text-emerald-500' : 'text-muted-foreground',
+            )}
+            title="Nifty peak points × the ATM delta proxy — how far the option premium itself moved at its best, not the underlying"
+          >
+            <TrendingUp className="h-3 w-3" />+{optionPeak.toFixed(1)}
           </span>
         ) : (
           <span className="text-muted-foreground">—</span>

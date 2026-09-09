@@ -48,6 +48,16 @@ export class TradesService {
     return this.prisma.tradeSignal.count({ where: { dateString: this.todayIso() } });
   }
 
+  /**
+   * Count of today's signals currently resolved at the given status — the
+   * input to the daily loss circuit breaker (counts STOPLOSS_HIT) and
+   * available generically for any other same-day status breakdown (e.g. a
+   * future win-rate widget) without a new method per status.
+   */
+  async countTodayByStatus(status: TradeStatus): Promise<number> {
+    return this.prisma.tradeSignal.count({ where: { dateString: this.todayIso(), currentStatus: status } });
+  }
+
   /** True if there is currently any position still being tracked. */
   async hasActivePosition(): Promise<boolean> {
     const active = await this.prisma.tradeSignal.findFirst({
@@ -68,6 +78,11 @@ export class TradesService {
         entrySpotPrice: input.entrySpotPrice,
         stopLossSpot: input.stopLossSpot,
         targetSpot: input.targetSpot,
+        // Anchors target-progress milestone tracking and the scaled
+        // profit-lock threshold — always equal to targetSpot at creation
+        // (no revision has happened yet), so it's derived here rather than
+        // asking every caller to pass the same value twice.
+        initialTargetSpot: input.targetSpot,
         atr14: input.atr14,
         targetBasis: input.targetBasis,
         currentStatus: TradeStatus.ACTIVE,
@@ -105,8 +120,9 @@ export class TradesService {
   /**
    * Persists any subset of a still-ACTIVE position's live-tracking fields —
    * the new peak-favorable price, a trailing-stop adjustment
-   * (stopLossSpot + trailStage), and/or the one-time stale-exit target
-   * reduction (targetSpot + staleAdjusted). Written to the DB the instant
+   * (stopLossSpot + trailStage), the one-time stale-exit target reduction
+   * (targetSpot + staleAdjusted), and/or a newly-crossed target-progress
+   * milestone (lastNotifiedMilestonePct). Written to the DB the instant
    * they change (not just held in memory) so every level survives a
    * restart of this service — the next tick simply re-reads it from
    * `findActivePositions()`.
@@ -119,6 +135,7 @@ export class TradesService {
       targetSpot: number;
       trailStage: TrailStage;
       staleAdjusted: boolean;
+      lastNotifiedMilestonePct: number;
     }>,
   ): Promise<void> {
     await this.prisma.tradeSignal.update({ where: { id }, data });

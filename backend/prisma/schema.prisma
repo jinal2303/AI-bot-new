@@ -109,6 +109,17 @@ model TradeSignal {
   /// fired for this position — guards against re-shrinking it every tick.
   /// See PositionMonitorService.applyStaleExitRule().
   staleAdjusted  Boolean      @default(false)
+  /// The target level exactly as set at creation, before any later
+  /// revision (the stale-exit pull-in, or a dynamic profit-lock exit) can
+  /// move `targetSpot` itself. Anchors target-progress milestone tracking
+  /// and the scaled profit-lock threshold so both stay stable regardless
+  /// of what happens to the live target afterward. Nullable only for rows
+  /// from before this field existed (which skip both features).
+  initialTargetSpot        Float?
+  /// Highest target-progress milestone (30/40/.../90) already notified for
+  /// this position — guards against re-notifying the same milestone every
+  /// 10s tick. 0 = none yet. See PositionMonitorService.checkTargetMilestones().
+  lastNotifiedMilestonePct Int    @default(0)
 
   // --- Indexes -------------------------------------------------------------
   // dateString:               daily-throttle COUNT and GET /signals/today

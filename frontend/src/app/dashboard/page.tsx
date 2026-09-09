@@ -97,6 +97,13 @@ export default function DashboardPage() {
           until tomorrow to prevent overtrading.
         </div>
       )}
+      {signal?.lossCircuitBreakerTripped && (
+        <div className="mb-6 flex items-center gap-2 rounded-lg border border-red-700/40 bg-red-700/10 px-4 py-3 text-sm text-red-400">
+          <OctagonAlert className="h-4 w-4 shrink-0" />
+          Daily loss circuit breaker tripped ({signal.stoplossHitCount}/{signal.maxDailyStoplossHits} stop-losses hit)
+          — evaluation is halted for the rest of the day.
+        </div>
+      )}
 
       <div className="mb-6">
         <TodayStats signals={todaySignals} maxDailySignals={signal?.maxDailySignals ?? 10} />

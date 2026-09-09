@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { randomUUID } from 'crypto';
-import { Direction } from '@prisma/client';
+import { Direction, TradeStatus } from '@prisma/client';
 import { MarketDataService } from '../market-data/market-data.service';
 import { IndicatorsService } from '../indicators/indicators.service';
 import { ExpiryService } from '../expiry/expiry.service';
@@ -28,8 +28,16 @@ export class SignalsService {
 
   private readonly symbol: string;
   private readonly strikeStep: number;
-  /** Max signals/day, clamped to [5, 10] regardless of configured value. */
+  /** Max signals/day — hard-capped at 5 regardless of configured value (see the desk's overtrading guard). */
   private readonly maxDailySignals: number;
+  /**
+   * Daily loss circuit breaker — once this many signals resolve
+   * STOPLOSS_HIT (the original, un-trailed risk stop) on the same IST
+   * date, evaluation halts entirely for the rest of the day, same as the
+   * daily signal-count throttle. TRAIL_STOP_HIT and TIME_EXIT don't count
+   * here — neither is ever a full-risk loss.
+   */
+  private readonly maxDailyStoplossHits: number;
 
   // --- Risk protocol, fixed to 1 lot with an ATM delta proxy of 0.5 -----
   /** Contract units per lot (desk convention hardcoded per spec: 65). */
@@ -65,10 +73,14 @@ export class SignalsService {
     this.symbol = this.configService.get<string>('NIFTY_SYMBOL', '^NSEI');
     this.strikeStep = Number(this.configService.get<string>('STRIKE_STEP', '50'));
 
-    const configuredMax = Number(this.configService.get<string>('MAX_DAILY_SIGNALS', '10'));
-    // "Max daily signal limits must be constrained between 5 to 10" — clamp
-    // defensively so a misconfigured .env can't silently disable the guard.
-    this.maxDailySignals = Math.min(10, Math.max(5, Number.isFinite(configuredMax) ? configuredMax : 10));
+    const configuredMax = Number(this.configService.get<string>('MAX_DAILY_SIGNALS', '5'));
+    // Strict 5-trade daily limit — hard-capped at 5 no matter what's
+    // configured (floor of 1 so a misconfigured/zero value under-trades
+    // rather than disabling evaluation entirely).
+    this.maxDailySignals = Math.min(5, Math.max(1, Number.isFinite(configuredMax) ? configuredMax : 5));
+
+    const configuredMaxStoplossHits = Number(this.configService.get<string>('MAX_DAILY_STOPLOSS_HITS', '2'));
+    this.maxDailyStoplossHits = Math.max(1, Number.isFinite(configuredMaxStoplossHits) ? configuredMaxStoplossHits : 2);
 
     this.lotSize = Number(this.configService.get<string>('LOT_SIZE', '65'));
     this.deltaProxy = Number(this.configService.get<string>('DELTA_PROXY', '0.5'));
@@ -120,19 +132,30 @@ export class SignalsService {
     this.isRefreshing = true;
 
     try {
-      // --- Daily overtrading guard --------------------------------------
-      // Checked BEFORE any indicator work — a maxed-out day skips the Yahoo
-      // Finance call entirely, not just the trade-creation step.
+      // --- Daily overtrading guard + loss circuit breaker -----------------
+      // Both checked BEFORE any indicator work — either one tripped skips
+      // the Yahoo Finance call entirely, not just the trade-creation step.
       const dailySignalCount = await this.tradesService.countToday();
+      const stoplossHitCount = await this.tradesService.countTodayByStatus(TradeStatus.STOPLOSS_HIT);
       const dailyLimitReached = dailySignalCount >= this.maxDailySignals;
+      const lossCircuitBreakerTripped = stoplossHitCount >= this.maxDailyStoplossHits;
 
-      if (dailyLimitReached) {
-        this.logger.warn(
-          `Daily signal limit reached (${dailySignalCount}/${this.maxDailySignals}) — halting evaluation until tomorrow.`,
-        );
+      if (dailyLimitReached || lossCircuitBreakerTripped) {
+        const reason = lossCircuitBreakerTripped
+          ? `Daily loss circuit breaker tripped (${stoplossHitCount}/${this.maxDailyStoplossHits} stop-losses hit)`
+          : `Daily signal limit reached (${dailySignalCount}/${this.maxDailySignals})`;
+        this.logger.warn(`${reason} — halting evaluation until tomorrow.`);
         this.latestSignal = this.latestSignal
-          ? { ...this.latestSignal, dailySignalCount, maxDailySignals: this.maxDailySignals, dailyLimitReached }
-          : this.buildFallbackSignal(dailySignalCount, dailyLimitReached, false);
+          ? {
+              ...this.latestSignal,
+              dailySignalCount,
+              maxDailySignals: this.maxDailySignals,
+              dailyLimitReached,
+              stoplossHitCount,
+              maxDailyStoplossHits: this.maxDailyStoplossHits,
+              lossCircuitBreakerTripped,
+            }
+          : this.buildFallbackSignal(dailySignalCount, dailyLimitReached, false, stoplossHitCount, lossCircuitBreakerTripped);
         return;
       }
 
@@ -234,6 +257,12 @@ export class SignalsService {
         dailySignalCount: refreshedCount,
         maxDailySignals: this.maxDailySignals,
         dailyLimitReached: refreshedCount >= this.maxDailySignals,
+        // Not re-fetched: only the 10s position monitor ever changes a
+        // STOPLOSS_HIT count, never this cron tick itself, so the value
+        // read at the top of this tick is still accurate here.
+        stoplossHitCount,
+        maxDailyStoplossHits: this.maxDailyStoplossHits,
+        lossCircuitBreakerTripped,
         hasActivePosition: refreshedHasActive,
       };
 
@@ -249,7 +278,7 @@ export class SignalsService {
       // as-is so the frontend keeps showing the last known-good state; if
       // nothing has ever succeeded, we surface a NO_SIGNAL placeholder.
       if (!this.latestSignal) {
-        this.latestSignal = this.buildFallbackSignal(0, false, false);
+        this.latestSignal = this.buildFallbackSignal(0, false, false, 0, false);
       }
     } finally {
       this.isRefreshing = false;
@@ -379,6 +408,8 @@ export class SignalsService {
     dailySignalCount: number,
     dailyLimitReached: boolean,
     hasActivePosition: boolean,
+    stoplossHitCount: number,
+    lossCircuitBreakerTripped: boolean,
   ): SignalData {
     return {
       id: randomUUID(),
@@ -401,6 +432,9 @@ export class SignalsService {
       dailySignalCount,
       maxDailySignals: this.maxDailySignals,
       dailyLimitReached,
+      stoplossHitCount,
+      maxDailyStoplossHits: this.maxDailyStoplossHits,
+      lossCircuitBreakerTripped,
       hasActivePosition,
     };
   }

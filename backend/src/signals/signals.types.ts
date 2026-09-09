@@ -96,9 +96,10 @@ export interface TradeRules {
   atr14: number;
   /**
    * Where the target came from: 'PIVOT' when the nearest resistance (CALL)
-   * / support (PUT) offered at least a 1:1 reward:risk and was used
-   * directly; 'ATR' when no pivot qualified and the symmetric ATR-sized
-   * target was used instead.
+   * / support (PUT) was at least as far away as the ATR-sized target
+   * distance (guaranteeing the configured reward:risk ratio, default 2:1)
+   * and was used directly; 'ATR' when no pivot qualified and the symmetric
+   * ATR-sized target was used instead. See SignalsService.resolveTargetPoints().
    */
   targetBasis: 'PIVOT' | 'ATR';
 }
@@ -129,6 +130,16 @@ export interface SignalData {
   dailySignalCount: number;
   maxDailySignals: number;
   dailyLimitReached: boolean;
+  /**
+   * Daily loss circuit breaker — count of signals resolved STOPLOSS_HIT
+   * (the original, un-trailed risk stop; TRAIL_STOP_HIT/TIME_EXIT don't
+   * count, since those are never full-risk losses) on today's IST date.
+   * See TradesService.countTodayByStatus().
+   */
+  stoplossHitCount: number;
+  maxDailyStoplossHits: number;
+  /** True once stoplossHitCount >= maxDailyStoplossHits — halts signal generation for the rest of the day. */
+  lossCircuitBreakerTripped: boolean;
   /** True while an ACTIVE persisted position is already being tracked — a
    *  fresh strategy read won't open a second one until it resolves. */
   hasActivePosition: boolean;

@@ -51,7 +51,7 @@ export interface TradeSignal {
   staleAdjusted: boolean;
 }
 
-/** Peak favorable move, in index points, since entry — null if not yet tracked. */
+/** Peak favorable move, in **Nifty index** points, since entry — null if not yet tracked. */
 export function peakPoints(signal: TradeSignal): number | null {
   if (signal.peakSpot === null) return null;
   return Math.abs(signal.peakSpot - signal.entrySpotPrice);
@@ -67,6 +67,19 @@ export function peakPoints(signal: TradeSignal): number | null {
  */
 export const LOT_SIZE = 65;
 export const DELTA_PROXY = 0.5;
+
+/**
+ * Peak favorable move actually captured on the **option** itself, not the
+ * underlying — "Peak Pts" is how far Nifty moved; this is how far the
+ * CALL/PUT premium moved at its best, i.e. Nifty peak points × the ATM
+ * delta proxy (an index point doesn't move the option point-for-point).
+ * Null if not yet tracked.
+ */
+export function peakOptionPoints(signal: TradeSignal): number | null {
+  const indexPeak = peakPoints(signal);
+  if (indexPeak === null) return null;
+  return indexPeak * DELTA_PROXY;
+}
 
 /**
  * Approx unrealized cash P&L (1 lot) for an ACTIVE position at the given

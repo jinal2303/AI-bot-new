@@ -6,29 +6,37 @@ import { Direction, TradeSignal, TradeStatus, TrailStage } from '@prisma/client'
 import { MarketDataService } from '../market-data/market-data.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { TradesService, ExitStatus } from './trades.service';
-import { isIndianMarketOpen } from '../common/market-hours.util';
-import { TRADE_STATUS_CHANGED_EVENT, TradeStatusChangedPayload } from './trade-events';
+import { isIndianMarketOpen, minutesUntilMarketClose } from '../common/market-hours.util';
+import { TARGET_MILESTONE_EVENT, TRADE_STATUS_CHANGED_EVENT, TargetMilestonePayload, TradeStatusChangedPayload } from './trade-events';
 
 const MS_PER_MINUTE = 60_000;
+
+/** 10%-wide target-progress bands notified once each — see `checkTargetMilestones()`. 100% is TARGET_HIT itself, already covered by its own exit notification. */
+const MILESTONE_PERCENTAGES = [30, 40, 50, 60, 70, 80, 90] as const;
 
 /**
  * Fast secondary ticker — every 10 seconds, independent of the 60s strategy
  * cron — that re-evaluates every currently ACTIVE position against the live
- * Nifty spot price. Three things happen here, in order, per position:
+ * Nifty spot price. Per position, in order:
  *
- *  1. Exit check — has the position's *current* target or stop-loss (which
- *     may since have been trailed) been crossed? If so, resolve it and move
- *     on; nothing below applies to an already-resolved position.
- *  2. Dynamic Profit Protection — has favorable movement earned the stop a
- *     ratchet up to breakeven, or further to a locked-in partial profit?
- *     See `applyTrailingStop()`.
- *  3. Stale-position handling — has the position gone stale (open too long,
- *     in profit, momentum stalled) and, if so, does it need its target
- *     pulled in or an outright forced exit? See `applyStaleExitRule()`.
+ *  1. Exit check — has the position's *current* target or trailed-stop been
+ *     crossed? Resolve and stop; nothing below applies once it's no longer ACTIVE.
+ *  2. Target-progress milestones — pure notification side effect (never
+ *     triggers an exit) — see `checkTargetMilestones()`.
+ *  3. Mandatory EOD square-off — 15 min before the 15:30 IST close,
+ *     unconditional. See below.
+ *  4. Dynamic Profit Protection — ratchet the stop-loss to breakeven, then
+ *     to a locked partial profit, as favorable movement deepens. See
+ *     `applyTrailingStop()`.
+ *  5. Dynamic Target Revision (peak giveback, scaled threshold) — lock in a
+ *     strong-but-fading move before it round-trips. See
+ *     `evaluateTargetRevisionExit()`.
+ *  6. Stale-position handling — target pull-in / forced time exit once a
+ *     position has gone quiet for too long. See `applyStaleExitRule()`.
  *
  * Every level change is persisted immediately (TradesService.updateActivePosition)
  * so it survives a restart of this service, and every adjustment/exit fires
- * both the existing WebSocket broadcast and the NotificationsService hook.
+ * both the WebSocket broadcast and the NotificationsService hook.
  */
 @Injectable()
 export class PositionMonitorService {
@@ -46,6 +54,12 @@ export class PositionMonitorService {
   private readonly staleExitMinutes: number;
   private readonly staleTargetReductionPct: number;
   private readonly staleMinFavorableAtrMult: number;
+
+  // --- Mandatory EOD square-off ------------------------------------------------
+  private readonly eodSquareOffMinutesBeforeClose: number;
+
+  // --- Dynamic target revision / peak giveback exit ----------------------------
+  private readonly peakGivebackAtrMult: number;
 
   /** Guards against overlapping ticks if a fetch/DB round-trip runs long. */
   private isTicking = false;
@@ -68,6 +82,13 @@ export class PositionMonitorService {
     this.staleExitMinutes = Number(this.configService.get<string>('STALE_EXIT_MINUTES', '30'));
     this.staleTargetReductionPct = Number(this.configService.get<string>('STALE_TARGET_REDUCTION_PCT', '0.30'));
     this.staleMinFavorableAtrMult = Number(this.configService.get<string>('STALE_MIN_FAVORABLE_ATR_MULT', '0.5'));
+
+    // Tied to the exchange close (minutesUntilMarketClose), not a second
+    // hardcoded clock — 15 min before 15:30 IST close = 15:15, the
+    // mandatory intraday square-off cutoff.
+    this.eodSquareOffMinutesBeforeClose = Number(this.configService.get<string>('EOD_SQUAREOFF_MINUTES_BEFORE_CLOSE', '15'));
+
+    this.peakGivebackAtrMult = Number(this.configService.get<string>('PEAK_GIVEBACK_ATR_MULT', '0.5'));
   }
 
   @Interval(10_000)
@@ -103,7 +124,12 @@ export class PositionMonitorService {
     }
   }
 
-  /** Runs the full per-position pipeline (exit check → trailing stop → stale-exit rule) for one tick. */
+  /**
+   * Runs the full per-position pipeline for one tick — see the class-level
+   * doc comment for the numbered steps. Each one returns early the moment
+   * it resolves the position; nothing later in the pipeline applies to a
+   * position that's no longer ACTIVE.
+   */
   private async trackPosition(position: TradeSignal, livePrice: number): Promise<void> {
     // Step 1 — best-favorable price so far, updated whether or not this tick
     // also resolves the position (a resolving tick is, by construction, at
@@ -123,14 +149,30 @@ export class PositionMonitorService {
       await this.tradesService.updateActivePosition(position.id, { peakSpot });
     }
 
+    // Step 3 — target-progress milestones. Pure notification side effect —
+    // never triggers an exit — so it runs unconditionally, ahead of every
+    // exit-triggering rule below, off the *current* live price (not peak).
+    await this.checkTargetMilestones(position, livePrice);
+
+    // Step 4 — mandatory EOD square-off. Unconditional (doesn't need atr14)
+    // and checked before every ATR-dependent rule below: "no overnight
+    // rollover" is a hard constraint, not a volatility-scaled one. Firing
+    // this tick means today's window (09:15–15:30 IST) has 15 minutes or
+    // less left — force-close at market now rather than risk the position
+    // monitor's own 10s cadence not catching it before the market shuts.
+    if (minutesUntilMarketClose(new Date()) <= this.eodSquareOffMinutesBeforeClose) {
+      await this.resolve(position, TradeStatus.TIME_EXIT, livePrice, peakSpot, 'mandatory EOD square-off — no overnight rollover');
+      return;
+    }
+
     // Legacy rows created before ATR-based sizing existed have no atr14 to
-    // scale the trailing/stale rules off — leave them on the plain
-    // fixed-level target/stop-loss check above, nothing more.
+    // scale the trailing/stale/target-revision rules off — leave them on the
+    // plain fixed-level target/stop-loss check (+ EOD square-off) above.
     if (position.atr14 === null) {
       return;
     }
 
-    // Step 3 — Dynamic Profit Protection: ratchet the stop-loss toward
+    // Step 5 — Dynamic Profit Protection: ratchet the stop-loss toward
     // (and past) breakeven as favorable movement deepens.
     const trailed = this.applyTrailingStop(position, peakSpot);
     if (trailed) {
@@ -141,12 +183,23 @@ export class PositionMonitorService {
       this.logger.log(
         `Position ${position.id} (${position.direction} ${position.strikePrice}) trailing stop → ${trailed.trailStage} — stop-loss moved to ${trailed.stopLossSpot.toFixed(2)}`,
       );
-      void this.notificationsService.send(
-        `🔧 *Trailing stop adjusted*\n${position.direction} ${position.strikePrice} — stage → *${trailed.trailStage}*\nNew stop-loss: ${trailed.stopLossSpot.toFixed(2)} (spot)`,
-      );
+      void this.notificationsService.notifyTrailingStopAdjusted(position, trailed.trailStage, trailed.stopLossSpot);
     }
 
-    // Step 4 — stale-position handling: only relevant once the position has
+    // Step 6 — Dynamic Target Revision (scaled peak-giveback exit): a
+    // supplementary protective layer on top of the stop-loss ratchet above.
+    // The ratchet only moves the *level* stopLossSpot sits at; this instead
+    // reacts directly to the shape of the move — a position that got most
+    // of the way to target and then reversed shouldn't have to wait for
+    // price to fall all the way back to whatever the current stop happens
+    // to be.
+    const revision = this.evaluateTargetRevisionExit(position, livePrice, peakSpot);
+    if (revision) {
+      await this.resolve(position, TradeStatus.TRAIL_STOP_HIT, livePrice, peakSpot, `Target Revised & Profit Locked at ${revision.lockedPct}%`);
+      return;
+    }
+
+    // Step 7 — stale-position handling: only relevant once the position has
     // actually been open for a while.
     const holdMinutes = (Date.now() - new Date(position.timestamp).getTime()) / MS_PER_MINUTE;
     if (holdMinutes < this.staleExitMinutes) {
@@ -155,7 +208,7 @@ export class PositionMonitorService {
 
     const staleOutcome = await this.applyStaleExitRule(position, livePrice, holdMinutes);
     if (staleOutcome) {
-      await this.resolve(position, TradeStatus.TIME_EXIT, livePrice, peakSpot);
+      await this.resolve(position, TradeStatus.TIME_EXIT, livePrice, peakSpot, 'stale position — profit decayed below the giveback floor');
     }
   }
 
@@ -181,16 +234,62 @@ export class PositionMonitorService {
   }
 
   /**
-   * REQUIREMENT 1 (Trailing Breakeven) + REQUIREMENT 2 (Dynamic Profit
-   * Lock). Both are expressed as "only ever improve stopLossSpot" via
-   * max (CALL) / min (PUT) against the position's *current* stop, so
-   * they compose safely regardless of which thresholds have already
-   * fired, and the stop can never be loosened by a later, less-favorable
-   * tick. The trigger itself is evaluated off `peakSpot` (the best price
-   * ever seen), not the current tick's `livePrice` — a brief spike to
-   * +1.5x ATR that has since pulled back to +1.1x ATR must still lock in
-   * the profit it earned; only the *level* is a fixed absolute distance
-   * from entry, not proportional to how far past the trigger price ran.
+   * TARGET PROGRESS MILESTONES (30% → 90%, in 10% bands). Measured against
+   * `initialTargetSpot` — the target exactly as set at creation — rather
+   * than the live `targetSpot`, so a later stale-exit target reduction
+   * doesn't retroactively shift what "50% of the way there" means mid-trade.
+   *
+   *   progressPct = (currentFavorableDistance / initialTargetDistance) × 100
+   *
+   * `lastNotifiedMilestonePct` (persisted on the row) is the guard against
+   * re-notifying the same band on every subsequent 10s tick. Every band
+   * strictly between what's already been notified and the current progress
+   * fires its own notification — so a fast move that jumps clean over more
+   * than one band between two ticks (e.g. a gap from 25% to 65%) still
+   * notifies each of 30/40/50/60 individually rather than silently
+   * collapsing them into one — before the persisted high-water mark is
+   * advanced to the highest band reached, in a single DB write.
+   */
+  private async checkTargetMilestones(position: TradeSignal, livePrice: number): Promise<void> {
+    const { direction, entrySpotPrice, initialTargetSpot, lastNotifiedMilestonePct } = position;
+    if (initialTargetSpot === null) return; // Legacy row — no stable anchor to measure progress against.
+
+    const initialTargetDistance = Math.abs(initialTargetSpot - entrySpotPrice);
+    if (initialTargetDistance === 0) return;
+
+    const isCall = direction === Direction.CALL;
+    const currentFavorableDistance = isCall ? livePrice - entrySpotPrice : entrySpotPrice - livePrice;
+    const progressPct = (currentFavorableDistance / initialTargetDistance) * 100;
+
+    const newlyCrossed = MILESTONE_PERCENTAGES.filter(
+      (milestone) => milestone > lastNotifiedMilestonePct && progressPct >= milestone,
+    );
+    if (newlyCrossed.length === 0) return;
+
+    const highest = newlyCrossed[newlyCrossed.length - 1];
+    await this.tradesService.updateActivePosition(position.id, { lastNotifiedMilestonePct: highest });
+
+    for (const milestone of newlyCrossed) {
+      this.logger.log(
+        `Position ${position.id} (${direction} ${position.strikePrice}) reached ${milestone}% of target (${progressPct.toFixed(1)}% actual)`,
+      );
+      const payload: TargetMilestonePayload = { signal: { ...position, lastNotifiedMilestonePct: highest }, milestonePct: milestone, progressPct, livePrice };
+      this.eventEmitter.emit(TARGET_MILESTONE_EVENT, payload);
+      void this.notificationsService.notifyTargetMilestone(position, milestone, progressPct, livePrice);
+    }
+  }
+
+  /**
+   * REQUIREMENT — Trailing Breakeven + Dynamic Profit Lock. Both are
+   * expressed as "only ever improve stopLossSpot" via max (CALL) / min
+   * (PUT) against the position's *current* stop, so they compose safely
+   * regardless of which thresholds have already fired, and the stop can
+   * never be loosened by a later, less-favorable tick. The trigger itself
+   * is evaluated off `peakSpot` (the best price ever seen), not the current
+   * tick's `livePrice` — a brief spike to +1.5x ATR that has since pulled
+   * back to +1.1x ATR must still lock in the profit it earned; only the
+   * *level* is a fixed absolute distance from entry, not proportional to
+   * how far past the trigger price ran.
    *
    * Returns the new (stopLossSpot, trailStage) pair only when something
    * actually changed — null means no adjustment was needed this tick.
@@ -231,15 +330,101 @@ export class PositionMonitorService {
   }
 
   /**
-   * REQUIREMENT 3 (Time-Based Stale Exit). Only reached once the position
-   * has been open >= staleExitMinutes. Two independent effects, both
-   * one-shot / idempotent:
+   * Scaled profit-lock threshold, tiered by the trade's entry-time target
+   * payoff (targetCashINR) — a smaller setup needs to travel a larger
+   * fraction of its own (already-modest) target before a reversal is worth
+   * banking early; a bigger payoff can afford to wait for less of it before
+   * locking in, since even a partial capture is still meaningful cash.
+   *
+   *   ₹1,000 – ₹1,500  → 70% of target distance
+   *   ₹1,501 – ₹2,999  → 60%
+   *   ≥ ₹3,000         → 50%
+   *
+   * `targetCashINR` isn't a persisted column — it's fully derived here from
+   * `initialTargetDistance × deltaProxy × lotSize`, the exact formula
+   * SignalsService used to compute it at signal-creation time, so it can
+   * never drift out of sync with the levels actually stored on the row.
+   */
+  private resolveTargetRevisionThresholdPct(targetCashINR: number): number {
+    if (targetCashINR >= 3000) return 0.5;
+    if (targetCashINR >= 1501) return 0.6;
+    return 0.7; // covers ₹1,000–₹1,500, and any edge case below (MIN_TARGET_CASH_INR should prevent that from occurring)
+  }
+
+  /**
+   * DYNAMIC TARGET REVISION & PEAK PROFIT LOCK (scaled thresholds) — a
+   * supplementary protective layer, independent of the stopLossSpot ratchet
+   * above. The trailing stop only protects once price has moved a fixed
+   * multiple of ATR; a move that got most of the way to *target* but is
+   * still short of even the breakeven trigger would otherwise be left
+   * completely unprotected while it gives that whole move back. This closes
+   * that gap directly off the move's shape instead of a fixed level:
+   *
+   *   1. Compute the scaled threshold for this trade's payoff size (see
+   *      `resolveTargetRevisionThresholdPct()`). Has peak favorable
+   *      movement ever reached that fraction of the distance to the
+   *      *original* target (`initialTargetSpot`, not the live one, so a
+   *      stale-exit reduction never lowers this bar after the fact)? If
+   *      not, the move never got interesting enough for a reversal to
+   *      matter here — the ordinary stop-loss/trailing-stop logic handles
+   *      it alone.
+   *   2. If so, has price since given back more than `peakGivebackAtrMult`
+   *      x ATR(14) (default 0.5x) from that peak? If so, revise the target
+   *      down to what was actually achieved and exit immediately at market
+   *      to lock in what's left of the move, rather than risk it fully
+   *      erasing before the (further-away) stop-loss level is reached.
+   *
+   * Resolves as TRAIL_STOP_HIT — like a trailed stop, this is a
+   * profit-protection exit, not a hit on the original risk stop; by
+   * construction it only fires after real favorable progress (>= the
+   * scaled threshold), so it lands on the winning side in the overwhelming
+   * majority of cases, though — same as any tick-based check — an
+   * unusually large single-tick reversal could in principle still land it
+   * slightly negative of entry.
+   */
+  private evaluateTargetRevisionExit(
+    position: TradeSignal,
+    livePrice: number,
+    peakSpot: number,
+  ): { lockedPct: number } | null {
+    const { direction, entrySpotPrice, initialTargetSpot, atr14 } = position;
+    if (atr14 === null || initialTargetSpot === null) return null;
+
+    const initialTargetDistance = Math.abs(initialTargetSpot - entrySpotPrice);
+    if (initialTargetDistance === 0) return null;
+
+    const targetCashINR = Math.round(initialTargetDistance * this.deltaProxy * this.lotSize);
+    const requiredThresholdPct = this.resolveTargetRevisionThresholdPct(targetCashINR);
+
+    const isCall = direction === Direction.CALL;
+    const peakFavorableDistance = isCall ? peakSpot - entrySpotPrice : entrySpotPrice - peakSpot;
+    const peakProgressFraction = peakFavorableDistance / initialTargetDistance;
+    if (peakProgressFraction < requiredThresholdPct) {
+      return null; // Never reached the scaled threshold — leave it to the ordinary stop-loss/trailing-stop logic.
+    }
+
+    const currentFavorableDistance = isCall ? livePrice - entrySpotPrice : entrySpotPrice - livePrice;
+    const givebackPoints = peakFavorableDistance - currentFavorableDistance;
+    if (givebackPoints <= atr14 * this.peakGivebackAtrMult) {
+      return null; // Hasn't reversed enough yet.
+    }
+
+    return { lockedPct: Math.round(peakProgressFraction * 100) };
+  }
+
+  /**
+   * REQUIREMENT — Time-Based Stale Exit. Only reached once the position has
+   * been open >= staleExitMinutes. Two independent effects, both one-shot /
+   * idempotent:
    *
    *   a) If still in profit and target was never reduced before, pull the
    *      target in by staleTargetReductionPct (default 30%) — a stalled
    *      move is less likely to still reach the original, more ambitious
    *      target, so give it a nearer one it can actually hit. Fires once
    *      per position (`staleAdjusted` guards re-shrinking it every tick).
+   *      Note this only ever touches the *live* `targetSpot`, never
+   *      `initialTargetSpot` — the milestone/target-revision math above
+   *      stays anchored to the original regardless.
    *   b) Regardless of (a), if the *current* favorable move has slipped
    *      back below staleMinFavorableAtrMult x ATR (default 0.5x) — i.e.
    *      the position is giving back the very edge that made it "stale but
@@ -271,9 +456,7 @@ export class PositionMonitorService {
       this.logger.log(
         `Position ${id} (${direction} ${position.strikePrice}) stale after ${holdMinutes.toFixed(0)}m — target pulled in ${(this.staleTargetReductionPct * 100).toFixed(0)}% to ${newTarget.toFixed(2)}`,
       );
-      void this.notificationsService.send(
-        `⏱️ *Stale position — target reduced*\n${direction} ${position.strikePrice} — open ${holdMinutes.toFixed(0)}m, momentum stalled.\nTarget pulled in to ${newTarget.toFixed(2)} (spot).`,
-      );
+      void this.notificationsService.notifyStaleTargetReduced(position, holdMinutes, newTarget);
     }
 
     // (b) Force exit if the favorable move has slipped back under the floor.
@@ -281,9 +464,7 @@ export class PositionMonitorService {
       this.logger.log(
         `Position ${id} (${direction} ${position.strikePrice}) stale + giving back profit (${favorablePoints.toFixed(1)}pts < ${(atr14 * this.staleMinFavorableAtrMult).toFixed(1)}pts floor) — forcing TIME_EXIT at market`,
       );
-      void this.notificationsService.send(
-        `🚪 *Time-decay exit*\n${direction} ${position.strikePrice} — open ${holdMinutes.toFixed(0)}m, gave back profit below the ${this.staleMinFavorableAtrMult}x ATR floor.\nExiting at market (${livePrice}).`,
-      );
+      void this.notificationsService.notifyStaleForceExit(position, holdMinutes, livePrice);
       return true;
     }
 
@@ -295,21 +476,24 @@ export class PositionMonitorService {
    * broadcasting it over both channels — the existing WebSocket event (for
    * the dashboard's live exit toast) and the notification hook.
    */
-  private async resolve(position: TradeSignal, status: ExitStatus, livePrice: number, peakSpot: number): Promise<void> {
+  private async resolve(
+    position: TradeSignal,
+    status: ExitStatus,
+    livePrice: number,
+    peakSpot: number,
+    reason?: string,
+  ): Promise<void> {
     const netCashINR = this.computeNetCashINR(position.direction, position.entrySpotPrice, livePrice);
     const updated = await this.tradesService.resolvePosition(position.id, status, livePrice, peakSpot, netCashINR);
 
     this.logger.log(
-      `Position ${updated.id} (${updated.direction} ${updated.strikePrice}) resolved → ${status} at spot ${livePrice} (₹${netCashINR})`,
+      `Position ${updated.id} (${updated.direction} ${updated.strikePrice}) resolved → ${status}${reason ? ` (${reason})` : ''} at spot ${livePrice} (₹${netCashINR})`,
     );
 
-    const payload: TradeStatusChangedPayload = { signal: updated, livePrice, netCashINR };
+    const payload: TradeStatusChangedPayload = { signal: updated, livePrice, netCashINR, reason };
     this.eventEmitter.emit(TRADE_STATUS_CHANGED_EVENT, payload);
 
-    const emoji = netCashINR >= 0 ? '✅' : '🛑';
-    void this.notificationsService.send(
-      `${emoji} *Position closed — ${status}*\n${updated.direction} ${updated.strikePrice} @ spot ${livePrice}\nP&L: ₹${netCashINR}`,
-    );
+    void this.notificationsService.notifyPositionClosed(updated, status, livePrice, netCashINR, reason);
   }
 
   /**
@@ -327,9 +511,10 @@ export class PositionMonitorService {
    * move between entry and the resolving tick — optionPoints × lotSize.
    * Deriving the sign from the real move (rather than a per-outcome lookup)
    * is both simpler and correct for every exit path here: TARGET_HIT and
-   * TRAIL_STOP_HIT only ever fire on the favorable side, STOPLOSS_HIT only
-   * on the unfavorable side, and TIME_EXIT can legitimately land on either
-   * side of entry — this formula gets all four right without special-casing.
+   * TRAIL_STOP_HIT almost always fire on the favorable side (see the
+   * caveat on `evaluateTargetRevisionExit()`), STOPLOSS_HIT only on the
+   * unfavorable side, and TIME_EXIT can legitimately land on either side of
+   * entry — this formula gets all of them right without special-casing.
    */
   private computeNetCashINR(direction: Direction, entrySpotPrice: number, resolvedSpot: number): number {
     const favorablePoints = direction === Direction.CALL ? resolvedSpot - entrySpotPrice : entrySpotPrice - resolvedSpot;
