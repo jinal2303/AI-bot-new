@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { fetchNewsHeadlines } from '@/lib/api';
 import { NewsHeadline } from '@/lib/news';
 
-const POLL_INTERVAL_MS = 5 * 60_000; // Headlines don't need the 30s cadence the trading data does.
+const POLL_INTERVAL_MS = 5 * 60_000; // Headlines don't need the fast cadence the trading data does.
 
 export interface UseNewsHeadlinesResult {
   headlines: NewsHeadline[];

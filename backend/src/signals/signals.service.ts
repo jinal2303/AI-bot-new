@@ -4,6 +4,24 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { randomUUID } from 'crypto';
 import { Direction, TradeStatus } from '@prisma/client';
+
+/**
+ * TESTING MODE SWITCH — daily-trade-limit bypass.
+ *
+ * While `false`, both the 5-trade daily cap AND the 2-stoploss daily kill
+ * switch below are bypassed entirely: evaluation never halts for either
+ * reason, so bulk/live strategy testing isn't throttled by production risk
+ * limits. `dailySignalCount` / `stoplossHitCount` / `dailyLimitReached` /
+ * `lossCircuitBreakerTripped` are still computed and returned on every
+ * snapshot either way (the dashboard keeps showing real counts) — only the
+ * *halt* behavior is gated.
+ *
+ * Flip this back to `true` before running against real capital. It can also
+ * be overridden per-environment via ENABLE_DAILY_LIMIT=true/false in .env
+ * without touching code — see the constructor — but this constant is the
+ * source of truth when that env var is unset.
+ */
+const ENABLE_DAILY_LIMIT = false;
 import { MarketDataService } from '../market-data/market-data.service';
 import { IndicatorsService } from '../indicators/indicators.service';
 import { ExpiryService } from '../expiry/expiry.service';
@@ -38,6 +56,19 @@ export class SignalsService {
    * here — neither is ever a full-risk loss.
    */
   private readonly maxDailyStoplossHits: number;
+  /** TESTING MODE — see the `ENABLE_DAILY_LIMIT` module constant above for what this gates. */
+  private readonly enableDailyLimit: boolean;
+
+  /**
+   * 10-MINUTE RE-ENTRY COOLDOWN GUARD — after ANY trade resolves
+   * (TARGET_HIT / TRAIL_STOP_HIT / STOPLOSS_HIT / TIME_EXIT), a fresh setup
+   * in that *same* direction is rejected for this many minutes, to stop
+   * rapid overtrading back-to-back in one direction. See the cooldown check
+   * in `refreshSignal()` and `TradesService.mostRecentResolutionTime()`.
+   * Independent of `enableDailyLimit` — this guard stays active in testing
+   * mode too, since it's a re-entry throttle, not a daily cap.
+   */
+  private readonly reentryCooldownMinutes: number;
 
   // --- Risk protocol, fixed to 1 lot with an ATM delta proxy of 0.5 -----
   /** Contract units per lot (desk convention hardcoded per spec: 65). */
@@ -81,6 +112,18 @@ export class SignalsService {
 
     const configuredMaxStoplossHits = Number(this.configService.get<string>('MAX_DAILY_STOPLOSS_HITS', '2'));
     this.maxDailyStoplossHits = Math.max(1, Number.isFinite(configuredMaxStoplossHits) ? configuredMaxStoplossHits : 2);
+
+    // TESTING MODE — env override wins when set; otherwise falls back to the
+    // ENABLE_DAILY_LIMIT constant at the top of this file.
+    const dailyLimitOverride = this.configService.get<string>('ENABLE_DAILY_LIMIT');
+    this.enableDailyLimit = dailyLimitOverride !== undefined ? dailyLimitOverride === 'true' : ENABLE_DAILY_LIMIT;
+    if (!this.enableDailyLimit) {
+      this.logger.warn(
+        '⚠️  TESTING MODE: daily 5-trade cap and 2-stoploss kill switch are DISABLED (ENABLE_DAILY_LIMIT=false). Re-enable before trading live capital.',
+      );
+    }
+
+    this.reentryCooldownMinutes = Number(this.configService.get<string>('REENTRY_COOLDOWN_MINUTES', '10'));
 
     this.lotSize = Number(this.configService.get<string>('LOT_SIZE', '65'));
     this.deltaProxy = Number(this.configService.get<string>('DELTA_PROXY', '0.5'));
@@ -135,12 +178,15 @@ export class SignalsService {
       // --- Daily overtrading guard + loss circuit breaker -----------------
       // Both checked BEFORE any indicator work — either one tripped skips
       // the Yahoo Finance call entirely, not just the trade-creation step.
+      // TESTING MODE: dailyLimitReached/lossCircuitBreakerTripped are still
+      // computed for the dashboard either way — `enableDailyLimit` only
+      // gates whether either one actually halts evaluation below.
       const dailySignalCount = await this.tradesService.countToday();
       const stoplossHitCount = await this.tradesService.countTodayByStatus(TradeStatus.STOPLOSS_HIT);
       const dailyLimitReached = dailySignalCount >= this.maxDailySignals;
       const lossCircuitBreakerTripped = stoplossHitCount >= this.maxDailyStoplossHits;
 
-      if (dailyLimitReached || lossCircuitBreakerTripped) {
+      if (this.enableDailyLimit && (dailyLimitReached || lossCircuitBreakerTripped)) {
         const reason = lossCircuitBreakerTripped
           ? `Daily loss circuit breaker tripped (${stoplossHitCount}/${this.maxDailyStoplossHits} stop-losses hit)`
           : `Daily signal limit reached (${dailySignalCount}/${this.maxDailySignals})`;
@@ -182,6 +228,30 @@ export class SignalsService {
         signal = 'NO_SIGNAL';
         optionType = null;
         tradeRules = null;
+      }
+
+      // --- 10-MINUTE RE-ENTRY COOLDOWN GUARD ------------------------------
+      // Blocks rapid overtrading in the same direction (e.g. three PUT
+      // trades back-to-back within 13 minutes): once a trade in a given
+      // direction has resolved (any terminal status), a fresh setup in that
+      // *same* direction is downgraded to NO_SIGNAL until reentryCooldownMinutes
+      // has elapsed since that resolution. The opposite direction is
+      // unaffected — only same-direction re-entry is throttled.
+      if (optionType !== null && tradeRules !== null) {
+        const desiredDirection = optionType === 'CE' ? Direction.CALL : Direction.PUT;
+        const lastResolvedAt = await this.tradesService.mostRecentResolutionTime(desiredDirection);
+        const cooldownMs = this.reentryCooldownMinutes * 60_000;
+        const elapsedMs = lastResolvedAt ? Date.now() - lastResolvedAt.getTime() : Infinity;
+
+        if (elapsedMs < cooldownMs) {
+          const remainingMinutes = ((cooldownMs - elapsedMs) / 60_000).toFixed(1);
+          this.logger.debug(
+            `Signal downgraded to NO_SIGNAL — ${desiredDirection} re-entry cooldown active (${remainingMinutes}m remaining)`,
+          );
+          signal = 'NO_SIGNAL';
+          optionType = null;
+          tradeRules = null;
+        }
       }
 
       // --- Persist a new position, if this tick actually opens one -------
@@ -267,7 +337,7 @@ export class SignalsService {
       };
 
       this.logger.log(
-        `Signal refreshed → ${signal} | spot=${this.latestSignal.spot} sma9=${this.latestSignal.sma9} rsi14=${this.latestSignal.rsi14} atr14=${this.latestSignal.atr14} atm=${atmStrike} expiry=${expiry.cycle} dailyCount=${refreshedCount}/${this.maxDailySignals} active=${refreshedHasActive}`,
+        `Signal refreshed → ${signal} | spot=${this.latestSignal.spot} sma9=${this.latestSignal.sma9} rsi14=${this.latestSignal.rsi14} atr14=${this.latestSignal.atr14} atm=${atmStrike} expiry=${expiry.cycle} dailyCount=${refreshedCount}/${this.maxDailySignals}${this.enableDailyLimit ? '' : ' (limit disabled — TESTING MODE)'} active=${refreshedHasActive}`,
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';

@@ -8,12 +8,20 @@ import { SignalsTable } from '@/components/signals-table';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { useArchive } from '@/hooks/use-archive';
-import { ArchiveFilters } from '@/lib/trade-signal';
+import { ArchiveFilters, todayIsoDate } from '@/lib/trade-signal';
 
 const PAGE_SIZE = 25;
 
 export default function ArchivePage() {
-  const [filters, setFilters] = useState<ArchiveFilters>({ limit: PAGE_SIZE, offset: 0 });
+  // Defaults to today's IST date — "today's calls" — rather than the full
+  // all-time history; the date pickers in ArchiveFiltersBar let the user
+  // widen or change the range from there.
+  const [filters, setFilters] = useState<ArchiveFilters>({
+    limit: PAGE_SIZE,
+    offset: 0,
+    dateFrom: todayIsoDate(),
+    dateTo: todayIsoDate(),
+  });
   const { result, isLoading, error } = useArchive(filters);
 
   const total = result?.total ?? 0;
@@ -27,7 +35,9 @@ export default function ArchivePage() {
       <header className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">Signal Archive</h1>
-          <p className="mt-1 text-sm text-muted-foreground">Every signal ever generated, filterable by outcome, direction, and expiry window.</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Every signal ever generated, filterable by outcome, direction, and expiry window — defaults to today.
+          </p>
         </div>
         <Nav />
       </header>

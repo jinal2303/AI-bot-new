@@ -2,7 +2,7 @@ import type { ReactNode } from 'react';
 import { RotateCcw } from 'lucide-react';
 import { Select } from '@/components/ui/select';
 import { Button } from '@/components/ui/button';
-import { ArchiveFilters } from '@/lib/trade-signal';
+import { ArchiveFilters, todayIsoDate } from '@/lib/trade-signal';
 
 interface ArchiveFiltersBarProps {
   filters: ArchiveFilters;
@@ -15,8 +15,11 @@ export function ArchiveFiltersBar({ filters, onChange }: ArchiveFiltersBarProps)
     onChange({ ...filters, [key]: value, offset: 0 });
   };
 
+  const today = todayIsoDate();
+  // "Default" is today's date range with no other filters — not empty dates
+  // — since the page itself now opens scoped to today rather than all time.
   const isDefault =
-    !filters.status && !filters.direction && !filters.expiryType && !filters.dateFrom && !filters.dateTo;
+    !filters.status && !filters.direction && !filters.expiryType && filters.dateFrom === today && filters.dateTo === today;
 
   return (
     <div className="flex flex-wrap items-end gap-3 rounded-lg border border-border bg-card p-4">
@@ -78,8 +81,9 @@ export function ArchiveFiltersBar({ filters, onChange }: ArchiveFiltersBarProps)
         variant="outline"
         size="sm"
         disabled={isDefault}
-        onClick={() => onChange({ limit: filters.limit, offset: 0 })}
+        onClick={() => onChange({ limit: filters.limit, offset: 0, dateFrom: today, dateTo: today })}
         className="gap-1.5"
+        title="Back to today, all outcomes/directions/expiries — clear the date fields by hand for full all-time history"
       >
         <RotateCcw className="h-3.5 w-3.5" />
         Reset

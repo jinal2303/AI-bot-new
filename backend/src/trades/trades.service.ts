@@ -67,6 +67,24 @@ export class TradesService {
     return active !== null;
   }
 
+  /**
+   * 10-MINUTE RE-ENTRY COOLDOWN GUARD — when the most recently *resolved*
+   * (any terminal status: TARGET_HIT / TRAIL_STOP_HIT / STOPLOSS_HIT /
+   * TIME_EXIT) trade in this direction closed. Not restricted to today's
+   * `dateString` — a trade resolved in the last few minutes of one session
+   * should still cool down a same-direction signal in the first minutes of
+   * the next tick cycle. Returns null if no trade in this direction has
+   * ever resolved. See SignalsService's re-entry cooldown check.
+   */
+  async mostRecentResolutionTime(direction: Direction): Promise<Date | null> {
+    const last = await this.prisma.tradeSignal.findFirst({
+      where: { direction, currentStatus: { not: TradeStatus.ACTIVE }, resolvedAt: { not: null } },
+      orderBy: { resolvedAt: 'desc' },
+      select: { resolvedAt: true },
+    });
+    return last?.resolvedAt ?? null;
+  }
+
   /** Creates a new ACTIVE signal for today. */
   async createSignal(input: CreateTradeSignalInput): Promise<TradeSignal> {
     const signal = await this.prisma.tradeSignal.create({

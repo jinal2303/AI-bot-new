@@ -50,6 +50,14 @@ export class PositionMonitorService {
   private readonly trailProfitLockAtrMult: number;
   private readonly trailProfitLockFraction: number;
 
+  // --- BREAKEVEN-LOCK-TRAP FIX ------------------------------------------------
+  // See `applyTrailingStop()`: once favorable movement reaches this many x ATR
+  // OR this many Nifty points (whichever comes first), the stop is no longer
+  // allowed to sit flat at breakeven — it's floored at entry ± minLockProfitAtrMult.
+  private readonly minLockTriggerAtrMult: number;
+  private readonly minLockTriggerPoints: number;
+  private readonly minLockProfitAtrMult: number;
+
   // --- Stale-position time exit ----------------------------------------------
   private readonly staleExitMinutes: number;
   private readonly staleTargetReductionPct: number;
@@ -60,6 +68,8 @@ export class PositionMonitorService {
 
   // --- Dynamic target revision / peak giveback exit ----------------------------
   private readonly peakGivebackAtrMult: number;
+  /** DYNAMIC PEAK GIVEBACK — absolute-points OR-trigger, alongside the scaled %-of-target threshold. See `evaluateTargetRevisionExit()`. */
+  private readonly peakGivebackTriggerPoints: number;
 
   /** Guards against overlapping ticks if a fetch/DB round-trip runs long. */
   private isTicking = false;
@@ -79,6 +89,13 @@ export class PositionMonitorService {
     this.trailProfitLockAtrMult = Number(this.configService.get<string>('TRAIL_PROFIT_LOCK_ATR_MULT', '1.5'));
     this.trailProfitLockFraction = Number(this.configService.get<string>('TRAIL_PROFIT_LOCK_FRACTION', '0.75'));
 
+    // BREAKEVEN-LOCK-TRAP FIX — defaults per spec: 1.3x ATR OR 20 Nifty
+    // points triggers a floor of entry ± 0.5x ATR of guaranteed profit,
+    // instead of the flat breakeven the trade would otherwise sit at.
+    this.minLockTriggerAtrMult = Number(this.configService.get<string>('TRAIL_MIN_LOCK_TRIGGER_ATR_MULT', '1.3'));
+    this.minLockTriggerPoints = Number(this.configService.get<string>('TRAIL_MIN_LOCK_TRIGGER_POINTS', '20'));
+    this.minLockProfitAtrMult = Number(this.configService.get<string>('TRAIL_MIN_LOCK_PROFIT_ATR_MULT', '0.5'));
+
     this.staleExitMinutes = Number(this.configService.get<string>('STALE_EXIT_MINUTES', '30'));
     this.staleTargetReductionPct = Number(this.configService.get<string>('STALE_TARGET_REDUCTION_PCT', '0.30'));
     this.staleMinFavorableAtrMult = Number(this.configService.get<string>('STALE_MIN_FAVORABLE_ATR_MULT', '0.5'));
@@ -89,6 +106,7 @@ export class PositionMonitorService {
     this.eodSquareOffMinutesBeforeClose = Number(this.configService.get<string>('EOD_SQUAREOFF_MINUTES_BEFORE_CLOSE', '15'));
 
     this.peakGivebackAtrMult = Number(this.configService.get<string>('PEAK_GIVEBACK_ATR_MULT', '0.5'));
+    this.peakGivebackTriggerPoints = Number(this.configService.get<string>('PEAK_GIVEBACK_TRIGGER_POINTS', '30'));
   }
 
   @Interval(10_000)
@@ -280,16 +298,23 @@ export class PositionMonitorService {
   }
 
   /**
-   * REQUIREMENT — Trailing Breakeven + Dynamic Profit Lock. Both are
-   * expressed as "only ever improve stopLossSpot" via max (CALL) / min
-   * (PUT) against the position's *current* stop, so they compose safely
-   * regardless of which thresholds have already fired, and the stop can
-   * never be loosened by a later, less-favorable tick. The trigger itself
-   * is evaluated off `peakSpot` (the best price ever seen), not the current
-   * tick's `livePrice` — a brief spike to +1.5x ATR that has since pulled
-   * back to +1.1x ATR must still lock in the profit it earned; only the
-   * *level* is a fixed absolute distance from entry, not proportional to
-   * how far past the trigger price ran.
+   * REQUIREMENT — Trailing Breakeven + Breakeven-Lock-Trap Fix + Dynamic
+   * Profit Lock, in three ratcheting stages:
+   *   1. +1.0x ATR  → stop → flat breakeven (entry).
+   *   2. +1.3x ATR OR +20 Nifty points (whichever first) → stop → entry ±
+   *      0.5x ATR of *guaranteed* profit (see the breakeven-lock-trap fix
+   *      block below) — a trade that ran this far no longer sits at flat
+   *      ₹0 on a pullback.
+   *   3. +1.5x ATR → stop → entry ± 0.75x ATR (supersedes both above).
+   * All three are expressed as "only ever improve stopLossSpot" via max
+   * (CALL) / min (PUT) against the position's *current* stop, so they
+   * compose safely regardless of which thresholds have already fired, and
+   * the stop can never be loosened by a later, less-favorable tick. The
+   * trigger itself is evaluated off `peakSpot` (the best price ever seen),
+   * not the current tick's `livePrice` — a brief spike to +1.5x ATR that
+   * has since pulled back to +1.1x ATR must still lock in the profit it
+   * earned; only the *level* is a fixed absolute distance from entry, not
+   * proportional to how far past the trigger price ran.
    *
    * Returns the new (stopLossSpot, trailStage) pair only when something
    * actually changed — null means no adjustment was needed this tick.
@@ -313,8 +338,25 @@ export class PositionMonitorService {
       if (candidateStage === TrailStage.NONE) candidateStage = TrailStage.BREAKEVEN;
     }
 
+    // --- BREAKEVEN-LOCK-TRAP FIX -------------------------------------------
+    // Holding the stop at a flat breakeven (₹0 profit) once a trade has run
+    // well past the breakeven trigger wastes real, already-earned gains — a
+    // pullback all the way to entry gives back movement that was there for
+    // the taking. Once favorable movement reaches minLockTriggerAtrMult x ATR
+    // (default 1.3x) OR minLockTriggerPoints Nifty points (default 20,
+    // whichever comes first), floor the stop at entry ± minLockProfitAtrMult
+    // x ATR (default 0.5x) of *guaranteed* profit instead of flat breakeven.
+    // Composes safely with both neighbors via max/min: never loosens a stop
+    // the breakeven shield or profit-lock stage below already set tighter.
+    if (peakFavorablePoints >= atr14 * this.minLockTriggerAtrMult || peakFavorablePoints >= this.minLockTriggerPoints) {
+      const minLockLevel = entrySpotPrice + (isCall ? 1 : -1) * atr14 * this.minLockProfitAtrMult;
+      candidateStopLoss = isCall ? Math.max(candidateStopLoss, minLockLevel) : Math.min(candidateStopLoss, minLockLevel);
+      if (candidateStage === TrailStage.NONE || candidateStage === TrailStage.BREAKEVEN) candidateStage = TrailStage.PROFIT_LOCK;
+    }
+
     // Profit lock — pull the stop further, to entry ± 0.75x ATR of
-    // *guaranteed* profit, once +1.5x ATR is reached. Supersedes breakeven.
+    // *guaranteed* profit, once +1.5x ATR is reached. Supersedes breakeven
+    // and the minimum-lock floor above (both are floors this only ever improves on).
     if (peakFavorablePoints >= atr14 * this.trailProfitLockAtrMult) {
       const lockLevel = entrySpotPrice + (isCall ? 1 : -1) * atr14 * this.trailProfitLockFraction;
       candidateStopLoss = isCall ? Math.max(candidateStopLoss, lockLevel) : Math.min(candidateStopLoss, lockLevel);
@@ -361,13 +403,17 @@ export class PositionMonitorService {
    * that gap directly off the move's shape instead of a fixed level:
    *
    *   1. Compute the scaled threshold for this trade's payoff size (see
-   *      `resolveTargetRevisionThresholdPct()`). Has peak favorable
-   *      movement ever reached that fraction of the distance to the
-   *      *original* target (`initialTargetSpot`, not the live one, so a
-   *      stale-exit reduction never lowers this bar after the fact)? If
-   *      not, the move never got interesting enough for a reversal to
-   *      matter here — the ordinary stop-loss/trailing-stop logic handles
-   *      it alone.
+   *      `resolveTargetRevisionThresholdPct()`). The giveback-monitoring
+   *      gate opens once EITHER peak favorable movement has reached that
+   *      fraction of the distance to the *original* target
+   *      (`initialTargetSpot`, not the live one, so a stale-exit reduction
+   *      never lowers this bar after the fact), OR peak favorable movement
+   *      has reached `peakGivebackTriggerPoints` (default 30) Nifty points
+   *      outright — a large absolute move deserves giveback protection even
+   *      on a big-target trade where 30pts is still short of the scaled %
+   *      threshold. If neither is met, the move never got interesting
+   *      enough for a reversal to matter here — the ordinary
+   *      stop-loss/trailing-stop logic handles it alone.
    *   2. If so, has price since given back more than `peakGivebackAtrMult`
    *      x ATR(14) (default 0.5x) from that peak? If so, revise the target
    *      down to what was actually achieved and exit immediately at market
@@ -399,8 +445,11 @@ export class PositionMonitorService {
     const isCall = direction === Direction.CALL;
     const peakFavorableDistance = isCall ? peakSpot - entrySpotPrice : entrySpotPrice - peakSpot;
     const peakProgressFraction = peakFavorableDistance / initialTargetDistance;
-    if (peakProgressFraction < requiredThresholdPct) {
-      return null; // Never reached the scaled threshold — leave it to the ordinary stop-loss/trailing-stop logic.
+    // DYNAMIC PEAK GIVEBACK GATE — scaled %-of-target threshold OR a flat
+    // absolute-points trigger, whichever opens the gate first.
+    const gateOpen = peakProgressFraction >= requiredThresholdPct || peakFavorableDistance >= this.peakGivebackTriggerPoints;
+    if (!gateOpen) {
+      return null; // Never reached either threshold — leave it to the ordinary stop-loss/trailing-stop logic.
     }
 
     const currentFavorableDistance = isCall ? livePrice - entrySpotPrice : entrySpotPrice - livePrice;

@@ -5,7 +5,7 @@ import { fetchLatestSignal } from '@/lib/api';
 import { requestNotificationPermission } from '@/lib/notifications';
 import { SignalData } from '@/lib/types';
 
-const POLL_INTERVAL_MS = 30_000;
+const POLL_INTERVAL_MS = 5_000;
 
 export interface UseSignalPollingResult {
   signal: SignalData | null;
@@ -16,7 +16,7 @@ export interface UseSignalPollingResult {
 }
 
 /**
- * Polls GET /api/signals/latest every 30 seconds for the live spot/SMA/RSI
+ * Polls GET /api/signals/latest every 5 seconds for the live spot/SMA/RSI
  * snapshot, chart series, and daily-throttle state, and requests desktop
  * notification permission on mount. Entry-signal desktop notifications are
  * handled separately by useTodaySignals — that hook watches the persisted

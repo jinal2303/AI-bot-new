@@ -380,11 +380,11 @@ plus a separate RSI(14) sub-panel with dashed boundary lines at 35/45/55/65.
 
 ### Live updates & notifications
 
-- [use-signal-polling.ts](frontend/src/hooks/use-signal-polling.ts) polls `/latest` every 30s for the live snapshot/chart, and requests `Notification.requestPermission()` on mount.
-- [use-today-signals.ts](frontend/src/hooks/use-today-signals.ts) polls `/today` every 30s. A row with an `id` never seen before is a genuinely new signal event — it fires:
+- [use-signal-polling.ts](frontend/src/hooks/use-signal-polling.ts) polls `/latest` every 5s for the live snapshot/chart, and requests `Notification.requestPermission()` on mount.
+- [use-today-signals.ts](frontend/src/hooks/use-today-signals.ts) polls `/today` every 5s. A row with an `id` never seen before is a genuinely new signal event — it fires:
   - **Title:** `🚨 BOT SIGNAL DETECTED!`
   - **Body:** `BUY NIFTY [Strike] [CE/PE] ([CURRENT/NEXT] Expiry) | 1 Lot (65 units)` / `Max Risk: -₹[X] | Target: +₹[Y]` (both ATR-derived, varying per signal)
-- Also fired **instantly** (no 30s poll wait) via [use-trade-socket.ts](frontend/src/hooks/use-trade-socket.ts)'s `signal-created` WebSocket listener — the poll is a resilience fallback only.
+- Also fired **instantly** (no poll wait) via [use-trade-socket.ts](frontend/src/hooks/use-trade-socket.ts)'s `signal-created` WebSocket listener — the poll is a resilience fallback only.
 - [use-trade-socket.ts](frontend/src/hooks/use-trade-socket.ts) connects to the WebSocket gateway. On `signal-status-changed` it instantly upserts the row into the today table/stats, pushes an in-app **[exit toast](frontend/src/components/exit-toast.tsx)**, and fires the native exit notification — win/loss is decided by the **sign of the realized `netCashINR`**, not the status string, so a `TRAIL_STOP_HIT` correctly shows as a win:
   - `🎯 TARGET ACHIEVED!` / `🛡️ TRAILING STOP HIT` / `⚠️ STOP-LOSS TRIGGERED` / `⏱️ TIME-DECAY EXIT`
   - Plus a distinct synthesized win/loss audio chime ([lib/sound.ts](frontend/src/lib/sound.ts), pure Web Audio oscillators — no external sound assets) alongside the OS's own default notification ping.

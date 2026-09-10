@@ -98,8 +98,13 @@ export function liveUnrealizedCashINR(signal: TradeSignal, livePrice: number | n
 export type CallType = 'INTRADAY' | 'DELIVERY';
 
 /** IST calendar date (YYYY-MM-DD) for an ISO instant — matches the format of the backend's `dateString`. */
-function istDateString(iso: string): string {
+export function istDateString(iso: string): string {
   return new Date(iso).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+}
+
+/** Today's IST calendar date (YYYY-MM-DD) — the default date-range bound for the Archive screen. */
+export function todayIsoDate(): string {
+  return istDateString(new Date().toISOString());
 }
 
 /**

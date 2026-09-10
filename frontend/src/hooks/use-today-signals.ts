@@ -5,7 +5,7 @@ import { fetchTodaySignals } from '@/lib/api';
 import { notifyNewEntry, RiskConfig } from '@/lib/notifications';
 import { TradeSignal } from '@/lib/trade-signal';
 
-const POLL_INTERVAL_MS = 30_000;
+const POLL_INTERVAL_MS = 5_000;
 
 export interface UseTodaySignalsResult {
   signals: TradeSignal[];
@@ -16,7 +16,7 @@ export interface UseTodaySignalsResult {
 }
 
 /**
- * Polls GET /api/signals/today every 30 seconds. Today's signals never get
+ * Polls GET /api/signals/today every 5 seconds. Today's signals never get
  * deleted mid-day (the backend only ever appends), so the returned list is
  * always the full, persistent, append-only feed the "Today" screen renders.
  *
@@ -74,7 +74,7 @@ export function useTodaySignals(riskConfig: RiskConfig | null): UseTodaySignalsR
   const upsertSignal = useCallback((updated: TradeSignal) => {
     setSignals((prev) => {
       const exists = prev.some((row) => row.id === updated.id);
-      // A signal that both opens AND resolves between two 30s polls would
+      // A signal that both opens AND resolves between two 5s polls would
       // otherwise never have been in `prev` for a plain .map() to find — the
       // WS event carries the full row either way, so insert it fresh
       // (newest-first) rather than dropping the update.

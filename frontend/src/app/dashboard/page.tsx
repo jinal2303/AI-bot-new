@@ -63,7 +63,7 @@ export default function DashboardPage() {
           </h1>
           <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
             <RefreshCcw className="h-3.5 w-3.5" />
-            Polling every 30s
+            Polling every 5s
             {lastUpdated && (
               <span>
                 · Last updated{' '}

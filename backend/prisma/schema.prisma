@@ -49,8 +49,11 @@ enum TrailStage {
   /// Favorable move reached 1x ATR(14) — stopLossSpot pulled to breakeven
   /// (entrySpotPrice), so the trade can no longer lose money.
   BREAKEVEN
-  /// Favorable move reached 1.5x ATR(14) — stopLossSpot pulled to lock in
-  /// 0.75x ATR(14) of guaranteed profit.
+  /// Favorable move reached (a) 1.3x ATR(14) OR 20 Nifty points — stopLossSpot
+  /// floored at 0.5x ATR(14) of guaranteed profit (the breakeven-lock-trap
+  /// fix, so the stop never just sits flat at breakeven), or (b) 1.5x ATR(14)
+  /// — stopLossSpot pulled further, to 0.75x ATR(14) of guaranteed profit.
+  /// See PositionMonitorService.applyTrailingStop().
   PROFIT_LOCK
 }
 
