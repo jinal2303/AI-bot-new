@@ -25,6 +25,16 @@ export interface IndicatorSnapshot {
   rsi14: number;
   /** Average True Range(14) — recent volatility, in index points; sizes the exit distances. */
   atr14: number;
+  /**
+   * MARKET-MOVEMENT-FIRST SIGNAL ENGINE — true when ATR(14) is higher now
+   * than `ATR_EXPANSION_LOOKBACK_BARS` bars ago: volatility is actually
+   * expanding, i.e. there's real market movement underway, not just a flat
+   * chop that happens to satisfy the SMA/RSI corridor. Defaults `true`
+   * (fails open) when there isn't yet enough candle history for the
+   * lookback comparison, so it never blocks every signal in the first bars
+   * of a fresh boot. See IndicatorsService.computeSnapshot().
+   */
+  atrExpanding: boolean;
   candleTimestamp: Date;
 }
 
@@ -56,6 +66,28 @@ export interface DailyLevels {
   resistance2: number;
   support1: number;
   support2: number;
+}
+
+/**
+ * PIVOT & STRUCTURE REACTION ANALYSIS — one structural price level the
+ * strategy treats as a place price is likely to react (bounce/reject/break)
+ * off of. Two sources feed the same array, merged and sorted by
+ * `IndicatorsService.computeReactionLevels()`:
+ *   - 'PIVOT'  — the classic floor-trader levels (Pivot/R1/R2/S1/S2),
+ *                derived from the *previous* day's H/L/C.
+ *   - 'SWING'  — intraday 5m swing-high/low clusters from *today's* candles
+ *                only, merged within an ATR-scaled tolerance so several
+ *                nearby touches collapse into one level.
+ * Consumed by SignalsService for both the entry reaction filter (does the
+ * latest candle show a breakout/breakdown/bounce/rejection at one of these?)
+ * and the target-snap (does a nearby level offer a qualifying distance to
+ * use as target instead of the plain symmetric ATR distance?).
+ */
+export interface ReactionLevel {
+  level: number;
+  kind: 'PIVOT' | 'SWING';
+  /** Touch count for a SWING cluster (how many local swing points merged into it); always 1 for a PIVOT level. */
+  strength: number;
 }
 
 /** Which weekly options-expiry cycle the current signal should trade, and when it falls. */
@@ -95,11 +127,13 @@ export interface TradeRules {
   /** The raw ATR(14) reading (index points) this trade's distances were sized from. */
   atr14: number;
   /**
-   * Where the target came from: 'PIVOT' when the nearest resistance (CALL)
-   * / support (PUT) was at least as far away as the ATR-sized target
-   * distance (guaranteeing the configured reward:risk ratio, default 2:1)
-   * and was used directly; 'ATR' when no pivot qualified and the symmetric
-   * ATR-sized target was used instead. See SignalsService.resolveTargetPoints().
+   * Where the target came from: 'PIVOT' when the nearest qualifying
+   * structural reaction level (a daily floor pivot OR an intraday 5m
+   * swing-high/low cluster — see `ReactionLevel`) in the trade's favorable
+   * direction was at least `STRUCTURE_MIN_TARGET_ATR_MULT` x ATR away
+   * (default 2x) and was snapped to directly; 'ATR' when no reaction level
+   * qualified and the symmetric ATR-sized target was used instead. See
+   * SignalsService.resolveTargetPoints().
    */
   targetBasis: 'PIVOT' | 'ATR';
 }

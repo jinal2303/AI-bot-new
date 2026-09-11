@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { SMA, RSI, ATR } from 'technicalindicators';
-import { CandleBar, DailyLevels, IndicatorSnapshot, SeriesPoint } from '../signals/signals.types';
+import { CandleBar, DailyLevels, IndicatorSnapshot, ReactionLevel, SeriesPoint } from '../signals/signals.types';
 import { toISTIsoDate } from '../common/ist-time.util';
 
 /**
@@ -17,9 +17,22 @@ export class IndicatorsService {
   private static readonly RSI_PERIOD = 14;
   private static readonly ATR_PERIOD = 14;
 
+  // --- PIVOT & STRUCTURE REACTION ANALYSIS ------------------------------------
+  /** Bars on each side that must be less-extreme for a candle's high/low to confirm as a local swing point. */
+  private static readonly SWING_WINDOW_BARS = 2;
+  /** Two swing points within this many x ATR(14) of each other merge into one reaction-level cluster. */
+  private static readonly SWING_CLUSTER_TOLERANCE_ATR_MULT = 0.3;
+
+  // --- MARKET-MOVEMENT-FIRST SIGNAL ENGINE ------------------------------------
+  /** How many 5m bars back `atrExpanding` compares the latest ATR(14) against — 6 bars ≈ 30 minutes. */
+  private static readonly ATR_EXPANSION_LOOKBACK_BARS = 6;
+
   /**
    * Computes the latest SMA(9) / RSI(14) / ATR(14) snapshot from a series
-   * of candles. Throws if there is not enough history to seed all three.
+   * of candles, plus the MARKET-MOVEMENT-FIRST `atrExpanding` read (is
+   * volatility actually expanding, i.e. is there real movement underway,
+   * not just a flat chop that happens to satisfy the SMA/RSI corridor?).
+   * Throws if there is not enough history to seed SMA/RSI/ATR themselves.
    */
   computeSnapshot(candles: CandleBar[]): IndicatorSnapshot {
     const minimumBars =
@@ -48,8 +61,17 @@ export class IndicatorsService {
     const rsi14 = rsiSeries[rsiSeries.length - 1];
     const atr14 = atrSeries[atrSeries.length - 1];
 
+    // MARKET-MOVEMENT-FIRST — ATR expansion check. Compares the latest
+    // ATR(14) to its reading ATR_EXPANSION_LOOKBACK_BARS bars ago: rising
+    // means volatility is genuinely expanding (real movement, not flat
+    // chop). Fails open (true) when there's not yet enough ATR history for
+    // the lookback — e.g. right after a fresh boot — rather than blocking
+    // every signal until that history accumulates.
+    const lookbackIndex = atrSeries.length - 1 - IndicatorsService.ATR_EXPANSION_LOOKBACK_BARS;
+    const atrExpanding = lookbackIndex >= 0 ? atr14 > atrSeries[lookbackIndex] : true;
+
     this.logger.debug(
-      `Computed indicators — spot: ${latestCandle.close}, SMA9: ${sma9.toFixed(2)}, RSI14: ${rsi14.toFixed(2)}, ATR14: ${atr14.toFixed(2)}`,
+      `Computed indicators — spot: ${latestCandle.close}, SMA9: ${sma9.toFixed(2)}, RSI14: ${rsi14.toFixed(2)}, ATR14: ${atr14.toFixed(2)}, atrExpanding: ${atrExpanding}`,
     );
 
     return {
@@ -57,6 +79,7 @@ export class IndicatorsService {
       sma9,
       rsi14,
       atr14,
+      atrExpanding,
       candleTimestamp: latestCandle.timestamp,
     };
   }
@@ -159,5 +182,98 @@ export class IndicatorsService {
       support1: 2 * pivot - prevHigh,
       support2: pivot - range,
     };
+  }
+
+  /**
+   * PIVOT & STRUCTURE REACTION ANALYSIS ENGINE (NEW).
+   *
+   * Builds the dynamic array of structural price levels SignalsService uses
+   * for both the entry reaction filter (breakout/breakdown/bounce/rejection
+   * confirmation) and the target-snap (see `resolveTargetPoints()` there).
+   * Two sources are merged into one sorted array:
+   *
+   *   1. The classic daily floor-trader pivots (Pivot/R1/R2/S1/S2), passed
+   *      in already computed by `computeDailyLevels()` — these are
+   *      well-known levels every participant is watching, one touch each.
+   *   2. Intraday 5m swing-high/low clusters, detected fresh from *today's*
+   *      candles only (yesterday's swings aren't "intraday structure" for
+   *      today — same session-boundary filtering as `computeSeries()`). A
+   *      bar confirms as a local swing high/low when its high/low is the
+   *      most extreme within a `SWING_WINDOW_BARS`-bar window on each side.
+   *      Raw swing points are then merged: any two within
+   *      `SWING_CLUSTER_TOLERANCE_ATR_MULT` x ATR(14) of each other collapse
+   *      into one level (the cluster's average price), with `strength` =
+   *      how many touches merged into it — several nearby reactions are a
+   *      stronger structural level than a single touch.
+   *
+   * `atr14` scales the cluster tolerance to the day's actual volatility
+   * (tight on a quiet day, wider on a choppy one) rather than a fixed point
+   * count that would over- or under-cluster depending on the session.
+   */
+  computeReactionLevels(candles: CandleBar[], dailyLevels: DailyLevels, atr14: number): ReactionLevel[] {
+    const pivotLevels = this.dailyLevelsToReactionLevels(dailyLevels);
+    if (candles.length === 0) {
+      return pivotLevels;
+    }
+
+    const latestSessionDate = toISTIsoDate(candles[candles.length - 1].timestamp);
+    const session = candles.filter((candle) => toISTIsoDate(candle.timestamp) === latestSessionDate);
+
+    const window = IndicatorsService.SWING_WINDOW_BARS;
+    const rawSwingPoints: number[] = [];
+    for (let i = window; i < session.length - window; i++) {
+      const neighborhood = session.slice(i - window, i + window + 1);
+      if (session[i].high === Math.max(...neighborhood.map((candle) => candle.high))) {
+        rawSwingPoints.push(session[i].high);
+      }
+      if (session[i].low === Math.min(...neighborhood.map((candle) => candle.low))) {
+        rawSwingPoints.push(session[i].low);
+      }
+    }
+
+    // Guard against a zero/near-zero ATR read (e.g. the very first bars of
+    // the day) collapsing every swing point into one giant cluster.
+    const tolerance = Math.max(atr14 * IndicatorsService.SWING_CLUSTER_TOLERANCE_ATR_MULT, 1);
+    const swingLevels = this.clusterSwingPoints(rawSwingPoints, tolerance);
+
+    return [...pivotLevels, ...swingLevels].sort((a, b) => a.level - b.level);
+  }
+
+  private dailyLevelsToReactionLevels(levels: DailyLevels): ReactionLevel[] {
+    return [
+      { level: levels.support2, kind: 'PIVOT', strength: 1 },
+      { level: levels.support1, kind: 'PIVOT', strength: 1 },
+      { level: levels.pivot, kind: 'PIVOT', strength: 1 },
+      { level: levels.resistance1, kind: 'PIVOT', strength: 1 },
+      { level: levels.resistance2, kind: 'PIVOT', strength: 1 },
+    ];
+  }
+
+  /** Merges raw swing-high/low prices within `tolerance` of each other into single-level clusters, sorted ascending before merging so only adjacent points are ever compared. */
+  private clusterSwingPoints(rawPoints: number[], tolerance: number): ReactionLevel[] {
+    if (rawPoints.length === 0) return [];
+
+    const sorted = [...rawPoints].sort((a, b) => a - b);
+    const clusters: { sum: number; count: number }[] = [];
+
+    for (const point of sorted) {
+      const current = clusters[clusters.length - 1];
+      if (current && point - current.sum / current.count <= tolerance) {
+        current.sum += point;
+        current.count += 1;
+      } else {
+        clusters.push({ sum: point, count: 1 });
+      }
+    }
+
+    return clusters.map((cluster) => ({
+      level: this.round(cluster.sum / cluster.count),
+      kind: 'SWING' as const,
+      strength: cluster.count,
+    }));
+  }
+
+  private round(value: number): number {
+    return Math.round(value * 100) / 100;
   }
 }

@@ -6,39 +6,46 @@ import { randomUUID } from 'crypto';
 import { Direction, TradeStatus } from '@prisma/client';
 
 /**
- * TESTING MODE SWITCH — daily-trade-limit bypass.
+ * PRODUCTION MODE (default) — daily-trade-limit enforcement.
  *
- * While `false`, both the 5-trade daily cap AND the 2-stoploss daily kill
- * switch below are bypassed entirely: evaluation never halts for either
- * reason, so bulk/live strategy testing isn't throttled by production risk
- * limits. `dailySignalCount` / `stoplossHitCount` / `dailyLimitReached` /
- * `lossCircuitBreakerTripped` are still computed and returned on every
- * snapshot either way (the dashboard keeps showing real counts) — only the
- * *halt* behavior is gated.
+ * `true`: both the daily signal-count cap (MAX_DAILY_SIGNALS) AND the
+ * stop-loss daily kill switch (MAX_DAILY_STOPLOSS_HITS) below are enforced —
+ * the bot trades the full day and halts itself once either limit trips. Set
+ * to `false` only for unlimited bulk/live strategy verification runs, where
+ * neither guard should throttle evaluation. `dailySignalCount` /
+ * `stoplossHitCount` / `dailyLimitReached` / `lossCircuitBreakerTripped` are
+ * still computed and returned on every snapshot either way (the dashboard
+ * keeps showing real counts) — only the *halt* behavior is gated.
  *
- * Flip this back to `true` before running against real capital. It can also
- * be overridden per-environment via ENABLE_DAILY_LIMIT=true/false in .env
- * without touching code — see the constructor — but this constant is the
- * source of truth when that env var is unset.
+ * Can be overridden per-environment via ENABLE_DAILY_LIMIT=true/false in
+ * .env without touching code — see the constructor — but this constant is
+ * the fail-safe source of truth when that env var is unset (a fresh deploy
+ * that forgets to set it lands in production-safe mode, not silent
+ * unlimited trading).
  */
-const ENABLE_DAILY_LIMIT = false;
+const ENABLE_DAILY_LIMIT = true;
 import { MarketDataService } from '../market-data/market-data.service';
 import { IndicatorsService } from '../indicators/indicators.service';
 import { ExpiryService } from '../expiry/expiry.service';
 import { TradesService } from '../trades/trades.service';
 import { TRADE_CREATED_EVENT, TradeCreatedPayload } from '../trades/trade-events';
-import { isIndianMarketOpen } from '../common/market-hours.util';
-import { DailyLevels, OptionType, SignalData, SignalDirection, TradeRules } from './signals.types';
+import { getSessionWindow, isIndianMarketOpen, SESSION_WINDOW_BOUNDS, SessionWindow } from '../common/market-hours.util';
+import { CandleBar, OptionType, ReactionLevel, SignalData, SignalDirection, TradeRules } from './signals.types';
 
 /**
- * Core strategy engine. On a schedule (and on-demand for the very first
- * request), it fetches fresh Nifty 50 candles, derives SMA(9) / RSI(14) /
- * ATR(14), decides whether a directional signal fires, and caches exactly
- * one "latest" signal snapshot in memory for the API to serve. When a
- * fresh, actionable setup appears — and the daily throttle/active-position
- * guards both allow it — it also persists a new TradeSignal row, which is
- * what the 10s position monitor and the dashboard's today/archive views
- * track from that point on.
+ * MARKET-MOVEMENT-FIRST SIGNAL ENGINE. On a schedule (and on-demand for the
+ * very first request), fetches fresh Nifty 50 candles, derives SMA(9) /
+ * RSI(14) / ATR(14) / ATR-expansion, decides whether a signal fires *purely*
+ * off high-probability market-movement criteria, and caches exactly one
+ * "latest" signal snapshot in memory for the API to serve. This is
+ * deliberately NOT a quota-filling engine — every cap in this file (daily
+ * count, daily stop-loss kill switch, per-session-window limits) is an
+ * UPPER BOUND on how many trades may be taken, never a target to reach; a
+ * quiet day that produces 0-3 actionable setups is expected and preferred
+ * over forcing a trade to look "active". When a fresh, actionable setup
+ * clears every quality filter AND every cap below, it persists a new
+ * TradeSignal row, which is what the 10s position monitor and the
+ * dashboard's today/archive views track from that point on.
  */
 @Injectable()
 export class SignalsService {
@@ -46,29 +53,72 @@ export class SignalsService {
 
   private readonly symbol: string;
   private readonly strikeStep: number;
-  /** Max signals/day — hard-capped at 5 regardless of configured value (see the desk's overtrading guard). */
+  /** SAFETY CAP — hard ceiling on trades/day, never exceeded regardless of configured value (see the desk's overtrading guard). This is an upper bound, not a quota to fill. */
   private readonly maxDailySignals: number;
   /**
-   * Daily loss circuit breaker — once this many signals resolve
+   * SAFETY CAP — daily loss circuit breaker. Once this many signals resolve
    * STOPLOSS_HIT (the original, un-trailed risk stop) on the same IST
    * date, evaluation halts entirely for the rest of the day, same as the
    * daily signal-count throttle. TRAIL_STOP_HIT and TIME_EXIT don't count
-   * here — neither is ever a full-risk loss.
+   * here — neither is ever a full-risk loss. Also a hard ceiling, never
+   * exceeded regardless of configured value.
    */
   private readonly maxDailyStoplossHits: number;
   /** TESTING MODE — see the `ENABLE_DAILY_LIMIT` module constant above for what this gates. */
   private readonly enableDailyLimit: boolean;
 
   /**
-   * 10-MINUTE RE-ENTRY COOLDOWN GUARD — after ANY trade resolves
-   * (TARGET_HIT / TRAIL_STOP_HIT / STOPLOSS_HIT / TIME_EXIT), a fresh setup
-   * in that *same* direction is rejected for this many minutes, to stop
-   * rapid overtrading back-to-back in one direction. See the cooldown check
-   * in `refreshSignal()` and `TradesService.mostRecentResolutionTime()`.
+   * RE-ENTRY COOLDOWN GUARD — after ANY trade resolves (TARGET_HIT /
+   * TRAIL_STOP_HIT / STOPLOSS_HIT / TIME_EXIT), a fresh setup in that
+   * *same* direction is rejected for this many minutes, to stop rapid
+   * overtrading back-to-back in one direction. See the cooldown check in
+   * `refreshSignal()` and `TradesService.mostRecentResolutionTime()`.
    * Independent of `enableDailyLimit` — this guard stays active in testing
    * mode too, since it's a re-entry throttle, not a daily cap.
    */
   private readonly reentryCooldownMinutes: number;
+
+  /**
+   * SESSION WINDOW UPPER LIMITS — a separate cap on how many NEW positions
+   * may be *opened* within each of the three named intraday windows (see
+   * `SESSION_WINDOW_BOUNDS` in market-hours.util.ts), independent of the
+   * overall daily cap above. Same "ceiling, not goal" philosophy: a window
+   * with 0 qualifying setups takes 0 trades. Mid-Day's cap is deliberately
+   * the tightest (the desk's choppiest stretch) and additionally requires
+   * the stricter PIVOT-only structural confirmation — see
+   * `passesStructuralReactionFilter()`'s `requirePivotLevel` param.
+   */
+  private readonly sessionWindowCaps: Record<SessionWindow, number>;
+
+  /**
+   * SAME-STRIKE LOSS BLACKLIST — after a trade resolves STOPLOSS_HIT, that
+   * exact (strikePrice, direction) is rejected for this many minutes, so the
+   * bot doesn't immediately re-enter the same strike in the same choppy
+   * zone that just stopped it out. See the blacklist check in
+   * `refreshSignal()` and `TradesService.mostRecentStoplossHitTime()`. Set
+   * this well above a trading session's length (e.g. 999) to blacklist for
+   * the rest of the day instead of a rolling window.
+   */
+  private readonly strikeBlacklistMinutes: number;
+
+  // --- PIVOT & STRUCTURE REACTION ANALYSIS ------------------------------------
+  /**
+   * How close (in x ATR(14)) the latest 5m candle's wick must come to a
+   * reaction level to count as a "bounce" (CALL) or "rejection" (PUT) off
+   * it — see `passesStructuralReactionFilter()`.
+   */
+  private readonly structureReactionToleranceAtrMult: number;
+  /**
+   * Minimum distance (in x ATR(14)) a structural reaction level must offer
+   * to qualify as `targetSpot`, snapping the target to it instead of the
+   * plain symmetric ATR distance — see `resolveTargetPoints()`. Per spec,
+   * tunable across 1.5x–2x ATR; defaults to 2x to preserve the desk's
+   * existing 2:1 reward:risk guarantee (indexStopLossPoints defaults to 1x
+   * ATR) — lower it toward 1.5x deliberately, not by accident, since that
+   * trades a smaller guaranteed reward:risk floor for tighter, more
+   * frequently-hit structural targets.
+   */
+  private readonly structureMinTargetAtrMult: number;
 
   // --- Risk protocol, fixed to 1 lot with an ATM delta proxy of 0.5 -----
   /** Contract units per lot (desk convention hardcoded per spec: 65). */
@@ -104,14 +154,17 @@ export class SignalsService {
     this.symbol = this.configService.get<string>('NIFTY_SYMBOL', '^NSEI');
     this.strikeStep = Number(this.configService.get<string>('STRIKE_STEP', '50'));
 
-    const configuredMax = Number(this.configService.get<string>('MAX_DAILY_SIGNALS', '5'));
-    // Strict 5-trade daily limit — hard-capped at 5 no matter what's
-    // configured (floor of 1 so a misconfigured/zero value under-trades
-    // rather than disabling evaluation entirely).
-    this.maxDailySignals = Math.min(5, Math.max(1, Number.isFinite(configuredMax) ? configuredMax : 5));
+    const configuredMax = Number(this.configService.get<string>('MAX_DAILY_SIGNALS', '10'));
+    // SAFETY CAP — hard-capped at 10 no matter what's configured (floor of
+    // 1 so a misconfigured/zero value under-trades rather than disabling
+    // evaluation entirely). This is a ceiling the market-movement-first
+    // engine may never reach on a quiet day, not a quota it's trying to fill.
+    this.maxDailySignals = Math.min(10, Math.max(1, Number.isFinite(configuredMax) ? configuredMax : 10));
 
-    const configuredMaxStoplossHits = Number(this.configService.get<string>('MAX_DAILY_STOPLOSS_HITS', '2'));
-    this.maxDailyStoplossHits = Math.max(1, Number.isFinite(configuredMaxStoplossHits) ? configuredMaxStoplossHits : 2);
+    const configuredMaxStoplossHits = Number(this.configService.get<string>('MAX_DAILY_STOPLOSS_HITS', '4'));
+    // SAFETY CAP — hard-capped at 4 no matter what's configured, same
+    // ceiling/floor reasoning as maxDailySignals above.
+    this.maxDailyStoplossHits = Math.min(4, Math.max(1, Number.isFinite(configuredMaxStoplossHits) ? configuredMaxStoplossHits : 4));
 
     // TESTING MODE — env override wins when set; otherwise falls back to the
     // ENABLE_DAILY_LIMIT constant at the top of this file.
@@ -119,11 +172,28 @@ export class SignalsService {
     this.enableDailyLimit = dailyLimitOverride !== undefined ? dailyLimitOverride === 'true' : ENABLE_DAILY_LIMIT;
     if (!this.enableDailyLimit) {
       this.logger.warn(
-        '⚠️  TESTING MODE: daily 5-trade cap and 2-stoploss kill switch are DISABLED (ENABLE_DAILY_LIMIT=false). Re-enable before trading live capital.',
+        `⚠️  TESTING MODE: daily ${this.maxDailySignals}-trade cap and ${this.maxDailyStoplossHits}-stoploss kill switch are DISABLED (ENABLE_DAILY_LIMIT=false). Re-enable before trading live capital.`,
       );
     }
 
-    this.reentryCooldownMinutes = Number(this.configService.get<string>('REENTRY_COOLDOWN_MINUTES', '10'));
+    // RE-ENTRY COOLDOWN — 15 minutes, per spec.
+    this.reentryCooldownMinutes = Number(this.configService.get<string>('REENTRY_COOLDOWN_MINUTES', '15'));
+
+    // SAME-STRIKE LOSS BLACKLIST default: 45 minutes, per spec.
+    this.strikeBlacklistMinutes = Number(this.configService.get<string>('STRIKE_BLACKLIST_MINUTES', '45'));
+
+    // SESSION WINDOW UPPER LIMITS — Morning 4 / Mid-Day 2 / Afternoon 4, per spec.
+    this.sessionWindowCaps = {
+      MORNING: Number(this.configService.get<string>('SESSION_CAP_MORNING', '4')),
+      MIDDAY: Number(this.configService.get<string>('SESSION_CAP_MIDDAY', '2')),
+      AFTERNOON: Number(this.configService.get<string>('SESSION_CAP_AFTERNOON', '4')),
+    };
+
+    // PIVOT & STRUCTURE REACTION ANALYSIS
+    this.structureReactionToleranceAtrMult = Number(
+      this.configService.get<string>('STRUCTURE_REACTION_TOLERANCE_ATR_MULT', '0.15'),
+    );
+    this.structureMinTargetAtrMult = Number(this.configService.get<string>('STRUCTURE_MIN_TARGET_ATR_MULT', '2'));
 
     this.lotSize = Number(this.configService.get<string>('LOT_SIZE', '65'));
     this.deltaProxy = Number(this.configService.get<string>('DELTA_PROXY', '0.5'));
@@ -211,9 +281,50 @@ export class SignalsService {
       const atmStrike = this.indicatorsService.computeAtmStrike(snapshot.spot, this.strikeStep);
       const expiry = this.expiryService.computeExpiryTarget();
       const dailyLevels = this.indicatorsService.computeDailyLevels(candles);
+      // PIVOT & STRUCTURE REACTION ANALYSIS ENGINE — the dynamic array of
+      // structural levels (daily floor pivots + intraday 5m swing-high/low
+      // clusters) consumed by both the entry filter below and the
+      // target-snap inside buildTradeRules() -> resolveTargetPoints().
+      const reactionLevels = this.indicatorsService.computeReactionLevels(candles, dailyLevels, snapshot.atr14);
+      // SESSION WINDOW UPPER LIMITS — which named window (if any) "now"
+      // falls in. Computed once, reused below by both the Mid-Day stricter
+      // structural-confirmation rule and the per-window cap filter.
+      const currentWindow = getSessionWindow(new Date());
 
       let { signal, optionType } = this.evaluateStrategy(snapshot.spot, snapshot.sma9, snapshot.rsi14);
-      let tradeRules = this.buildTradeRules(signal, snapshot.spot, snapshot.atr14, dailyLevels);
+
+      // --- MARKET-MOVEMENT-FIRST FILTER: ATR expansion (NEW) --------------
+      // The SMA/RSI corridor alone can't tell a genuine breakout from a
+      // flat chop that happens to sit in the right zone. Require ATR(14)
+      // to actually be expanding — real volatility/movement underway — or
+      // downgrade to NO_SIGNAL rather than take a directionally-plausible
+      // but movement-less setup. See IndicatorsService.computeSnapshot().
+      if (signal !== 'NO_SIGNAL' && !snapshot.atrExpanding) {
+        this.logger.debug(`Signal downgraded to NO_SIGNAL — ${signal} lacks ATR expansion (no real market movement underway)`);
+        signal = 'NO_SIGNAL';
+        optionType = null;
+      }
+
+      // --- STRUCTURAL PIVOT-REACTION FILTER -------------------------------
+      // The SMA/RSI read above only says "the trend direction looks right";
+      // it says nothing about *where* price actually is relative to the
+      // levels the rest of the market is watching. Require confirmation —
+      // a breakout/bounce for a CALL, a breakdown/rejection for a PUT — off
+      // a real reaction level before taking the setup at all. Mid-Day
+      // (10:30–13:15, the desk's choppiest stretch) requires the STRICTER
+      // form: the reacted-off level must be a genuine daily floor pivot
+      // (kind 'PIVOT'), not just an intraday swing cluster (kind 'SWING') —
+      // see `passesStructuralReactionFilter()`'s `requirePivotLevel` param.
+      const requirePivotLevel = currentWindow === 'MIDDAY';
+      if (signal !== 'NO_SIGNAL' && !this.passesStructuralReactionFilter(signal, candles, reactionLevels, snapshot.atr14, requirePivotLevel)) {
+        this.logger.debug(
+          `Signal downgraded to NO_SIGNAL — ${signal} lacks structural confirmation (no breakout/breakdown/bounce/rejection at a key${requirePivotLevel ? ' floor-pivot' : ''} reaction level)`,
+        );
+        signal = 'NO_SIGNAL';
+        optionType = null;
+      }
+
+      let tradeRules = this.buildTradeRules(signal, snapshot.spot, snapshot.atr14, reactionLevels);
 
       // --- Minimum-profit filter ------------------------------------------
       // A setup that technically clears the RSI/SMA/R:R bars but only pays
@@ -230,9 +341,9 @@ export class SignalsService {
         tradeRules = null;
       }
 
-      // --- 10-MINUTE RE-ENTRY COOLDOWN GUARD ------------------------------
+      // --- RE-ENTRY COOLDOWN GUARD (15 minutes) ---------------------------
       // Blocks rapid overtrading in the same direction (e.g. three PUT
-      // trades back-to-back within 13 minutes): once a trade in a given
+      // trades back-to-back within 18 minutes): once a trade in a given
       // direction has resolved (any terminal status), a fresh setup in that
       // *same* direction is downgraded to NO_SIGNAL until reentryCooldownMinutes
       // has elapsed since that resolution. The opposite direction is
@@ -251,6 +362,61 @@ export class SignalsService {
           signal = 'NO_SIGNAL';
           optionType = null;
           tradeRules = null;
+        }
+      }
+
+      // --- SAME-STRIKE LOSS BLACKLIST --------------------------------------
+      // Prevents re-entering the exact strike (e.g. 23,400 PE) that most
+      // recently stopped this bot out at its original risk stop — a choppy
+      // zone that hit one strike's stop-loss is very likely to do it again
+      // within the blacklist window. Only STOPLOSS_HIT blacklists a strike;
+      // TARGET_HIT/TRAIL_STOP_HIT/TIME_EXIT don't, since those aren't losses.
+      if (optionType !== null && tradeRules !== null) {
+        const desiredDirection = optionType === 'CE' ? Direction.CALL : Direction.PUT;
+        const lastStoplossHitAt = await this.tradesService.mostRecentStoplossHitTime(atmStrike, desiredDirection);
+        const blacklistMs = this.strikeBlacklistMinutes * 60_000;
+        const elapsedSinceStoplossMs = lastStoplossHitAt ? Date.now() - lastStoplossHitAt.getTime() : Infinity;
+
+        if (elapsedSinceStoplossMs < blacklistMs) {
+          const remainingMinutes = ((blacklistMs - elapsedSinceStoplossMs) / 60_000).toFixed(1);
+          const strikeKey = `${atmStrike}_${desiredDirection === Direction.CALL ? 'CALL' : 'PUT'}`;
+          this.logger.debug(
+            `Signal downgraded to NO_SIGNAL — strike ${strikeKey} is blacklisted after a recent STOPLOSS_HIT (${remainingMinutes}m remaining)`,
+          );
+          signal = 'NO_SIGNAL';
+          optionType = null;
+          tradeRules = null;
+        }
+      }
+
+      // --- SESSION WINDOW UPPER LIMITS (caps, not goals) -------------------
+      // A supplementary throttle to the overall daily cap: how many NEW
+      // positions have already been opened within the *current* named
+      // window (Morning 09:15–10:30 max 4 / Mid-Day 10:30–13:15 max 2 /
+      // Afternoon 13:15–15:15 max 4)? A window with 0 qualifying setups
+      // simply takes 0 trades — this only ever blocks, never fills, a
+      // window's remaining headroom. Outside all three windows (the
+      // 15:15–15:30 EOD-only tail) no new entries are allowed at all,
+      // regardless of the daily/window counts.
+      if (optionType !== null && tradeRules !== null) {
+        if (currentWindow === null) {
+          this.logger.debug('Signal downgraded to NO_SIGNAL — outside every session window (past 15:15 IST, EOD square-off only)');
+          signal = 'NO_SIGNAL';
+          optionType = null;
+          tradeRules = null;
+        } else {
+          const { startMinutes, endMinutes } = SESSION_WINDOW_BOUNDS[currentWindow];
+          const windowCount = await this.tradesService.countTodayInWindow(startMinutes, endMinutes);
+          const windowCap = this.sessionWindowCaps[currentWindow];
+
+          if (windowCount >= windowCap) {
+            this.logger.debug(
+              `Signal downgraded to NO_SIGNAL — ${currentWindow} session window cap reached (${windowCount}/${windowCap})`,
+            );
+            signal = 'NO_SIGNAL';
+            optionType = null;
+            tradeRules = null;
+          }
         }
       }
 
@@ -379,11 +545,75 @@ export class SignalsService {
   }
 
   /**
+   * PIVOT & STRUCTURE REACTION ANALYSIS — signal-filter half. Confirms the
+   * SMA/RSI directional read (`evaluateStrategy()`) against actual
+   * price-action at a real structural level, off the most recently
+   * completed 5m candle:
+   *
+   *   - BUY CALL (CE): either a breakout (candle closed above the nearest
+   *     reaction level overhead) OR a bounce off strong support (the
+   *     candle's low wicked into a level below — within
+   *     `structureReactionToleranceAtrMult` x ATR — but closed back above
+   *     it, i.e. support held).
+   *   - BUY PUT (PE): either a breakdown (candle closed below the nearest
+   *     reaction level underneath) OR a rejection from resistance (the
+   *     candle's high wicked into a level above but closed back below it,
+   *     i.e. resistance held).
+   *
+   * `requirePivotLevel` (SESSION WINDOW UPPER LIMITS — Mid-Day's extra
+   * confirmation requirement): when true, only kind==='PIVOT' levels (the
+   * classic daily floor pivots) are eligible to confirm against — intraday
+   * SWING clusters don't count. Mid-Day is the desk's choppiest stretch, so
+   * its lower trade cap is paired with demanding a "cleaner" reaction off a
+   * level every participant is watching, not just a locally-detected swing.
+   *
+   * Fails open (returns true) when there's simply no eligible level on the
+   * relevant side to react off of — this is a confirmation filter, not a
+   * second excuse to block a signal that has nothing structural nearby to
+   * fail against.
+   */
+  private passesStructuralReactionFilter(
+    signal: SignalDirection,
+    candles: CandleBar[],
+    reactionLevels: ReactionLevel[],
+    atr14: number,
+    requirePivotLevel: boolean,
+  ): boolean {
+    if (signal === 'NO_SIGNAL' || candles.length === 0) return true;
+
+    const lastCandle = candles[candles.length - 1];
+    const tolerance = Math.max(atr14 * this.structureReactionToleranceAtrMult, 1);
+
+    const eligibleLevels = requirePivotLevel ? reactionLevels.filter((l) => l.kind === 'PIVOT') : reactionLevels;
+    const levelsBelow = eligibleLevels.map((l) => l.level).filter((level) => level < lastCandle.close);
+    const levelsAbove = eligibleLevels.map((l) => l.level).filter((level) => level > lastCandle.close);
+    const nearestSupport = levelsBelow.length > 0 ? Math.max(...levelsBelow) : null;
+    const nearestResistance = levelsAbove.length > 0 ? Math.min(...levelsAbove) : null;
+
+    if (nearestSupport === null && nearestResistance === null) {
+      return true; // No structural context at all to confirm or deny against — fail open.
+    }
+
+    if (signal === 'BUY CALL (CE)') {
+      const breakoutAboveResistance = nearestResistance !== null && lastCandle.close > nearestResistance;
+      const bounceOffSupport =
+        nearestSupport !== null && lastCandle.low <= nearestSupport + tolerance && lastCandle.close > nearestSupport;
+      return breakoutAboveResistance || bounceOffSupport;
+    }
+
+    // BUY PUT (PE)
+    const breakdownBelowSupport = nearestSupport !== null && lastCandle.close < nearestSupport;
+    const rejectionFromResistance =
+      nearestResistance !== null && lastCandle.high >= nearestResistance - tolerance && lastCandle.close < nearestResistance;
+    return breakdownBelowSupport || rejectionFromResistance;
+  }
+
+  /**
    * Builds the 1-lot risk-protocol matrix for an active signal. Stop-loss
    * is sized off the *current* ATR(14) reading — `stopLoss = ATR ×
    * atrStopLossMultiplier` — so a volatile session naturally gets more
    * room and a quiet one gets pulled in tighter. The target prefers a real
-   * support/resistance pivot in the trade's favor over a symmetric ATR
+   * structural reaction level in the trade's favor over a symmetric ATR
    * distance — see `resolveTargetPoints()`. Returns null for NO_SIGNAL,
    * since there is no trade to manage.
    */
@@ -391,7 +621,7 @@ export class SignalsService {
     signal: SignalDirection,
     entryPrice: number,
     atr14: number,
-    dailyLevels: DailyLevels,
+    reactionLevels: ReactionLevel[],
   ): TradeRules | null {
     if (signal === 'NO_SIGNAL') {
       return null;
@@ -400,7 +630,7 @@ export class SignalsService {
     const direction = signal === 'BUY CALL (CE)' ? 1 : -1;
     const indexStopLossPoints = this.round(atr14 * this.atrStopLossMultiplier);
     const atrTargetPoints = this.round(atr14 * this.atrTargetMultiplier);
-    const { indexTargetPoints, targetBasis } = this.resolveTargetPoints(direction, entryPrice, atrTargetPoints, dailyLevels);
+    const { indexTargetPoints, targetBasis } = this.resolveTargetPoints(direction, entryPrice, atrTargetPoints, atr14, reactionLevels);
 
     const optionTargetPoints = this.round(indexTargetPoints * this.deltaProxy);
     const optionStopLossPoints = this.round(indexStopLossPoints * this.deltaProxy);
@@ -426,48 +656,57 @@ export class SignalsService {
   }
 
   /**
-   * Step 1 — find the nearest support/resistance pivot in the trade's
-   * favorable direction (resistance above entry for a CALL, support below
-   * entry for a PUT); a farther pivot is never relevant since price would
-   * reach the nearer one first.
+   * PIVOT & STRUCTURE REACTION ANALYSIS — target-snap half.
+   *
+   * Step 1 — find the nearest structural reaction level in the trade's
+   * favorable direction (above entry for a CALL, below entry for a PUT),
+   * drawn from the FULL merged set `computeReactionLevels()` built — daily
+   * floor pivots AND intraday 5m swing-high/low clusters, not just the four
+   * floor-pivot numbers; a farther level is never relevant since price
+   * would reach the nearer one first.
    *
    * Step 2 — `atrTargetPoints` (ATR × ATR_TARGET_MULTIPLIER, default 2×ATR)
-   * is both the fallback target *and* the qualifying bar for the pivot.
+   * is the fallback target. The qualifying bar for snapping to a reaction
+   * level instead is `structureMinTargetAtrMult` x ATR (independently
+   * configurable, default 2x — see the field doc for why it isn't simply
+   * reused from atrTargetPoints/atrTargetMultiplier).
    *
-   * Step 3 — use the pivot as target only when it is at least as far as
-   * atrTargetPoints; otherwise fall back to atrTargetPoints itself. This
-   * guarantees indexTargetPoints is NEVER less than atrTargetPoints,
-   * whichever branch fires — and therefore never below the default 2:1
-   * reward:risk versus indexStopLossPoints (ATR × ATR_STOPLOSS_MULTIPLIER).
+   * Step 3 — use the level as target only when it clears that bar;
+   * otherwise fall back to atrTargetPoints itself. With the default 2x
+   * setting for both knobs this guarantees indexTargetPoints is NEVER less
+   * than atrTargetPoints, same guarantee as before the structure-levels
+   * change — lowering structureMinTargetAtrMult toward 1.5x deliberately
+   * trades some of that reward:risk floor for tighter, more frequently-hit
+   * targets (see the field doc).
    *
-   * BUGFIX: this previously qualified a pivot against `indexStopLossPoints`
-   * (1×ATR by default) instead of `atrTargetPoints` (2×ATR) — the wrong
-   * yardstick. A pivot sitting anywhere between 1x and 2x ATR away used to
-   * pass that check and get selected as target, silently shipping trades
-   * with as little as ~1:1 reward:risk while believing they were 2:1,
-   * since pivot placement is essentially independent of ATR and this was
-   * the *common* case, not an edge case.
+   * BUGFIX (carried over): this must qualify a candidate level against the
+   * ATR TARGET distance (or structureMinTargetAtrMult, its explicit
+   * successor), never against indexStopLossPoints (1×ATR by default) — a
+   * level sitting between 1x and 2x ATR away passing that check would
+   * silently ship trades with as little as ~1:1 reward:risk while believing
+   * they were 2:1, since level placement is essentially independent of ATR
+   * and this was the *common* case, not an edge case.
    */
   private resolveTargetPoints(
     direction: 1 | -1,
     entryPrice: number,
     atrTargetPoints: number,
-    levels: DailyLevels,
+    atr14: number,
+    reactionLevels: ReactionLevel[],
   ): { indexTargetPoints: number; targetBasis: 'PIVOT' | 'ATR' } {
     // Step 1
-    const candidates =
-      direction === 1
-        ? [levels.resistance1, levels.resistance2].filter((level) => level > entryPrice)
-        : [levels.support1, levels.support2].filter((level) => level < entryPrice);
+    const candidates = reactionLevels
+      .map((reactionLevel) => reactionLevel.level)
+      .filter((level) => (direction === 1 ? level > entryPrice : level < entryPrice));
 
     if (candidates.length > 0) {
-      const nearestPivot = direction === 1 ? Math.min(...candidates) : Math.max(...candidates);
-      const pivotDistance = this.round(Math.abs(nearestPivot - entryPrice));
+      const nearestLevel = direction === 1 ? Math.min(...candidates) : Math.max(...candidates);
+      const levelDistance = this.round(Math.abs(nearestLevel - entryPrice));
 
-      // Step 3 — qualify against the ATR TARGET distance, not the
-      // stop-loss distance (see BUGFIX note above).
-      if (pivotDistance >= atrTargetPoints) {
-        return { indexTargetPoints: pivotDistance, targetBasis: 'PIVOT' };
+      // Step 3 — qualify against the structural target-snap distance (see
+      // BUGFIX note above), independent of the ATR fallback multiplier.
+      if (levelDistance >= atr14 * this.structureMinTargetAtrMult) {
+        return { indexTargetPoints: levelDistance, targetBasis: 'PIVOT' };
       }
     }
 

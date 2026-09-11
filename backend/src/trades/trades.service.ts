@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Direction, ExpiryType, Prisma, TargetBasis, TradeSignal, TradeStatus, TrailStage } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { toISTIsoDate } from '../common/ist-time.util';
+import { getISTDateParts, toISTIsoDate } from '../common/ist-time.util';
 import { ArchiveQueryDto } from './dto/archive-query.dto';
 
 /** Every terminal status the 10s position monitor can resolve an ACTIVE position to. */
@@ -58,6 +58,29 @@ export class TradesService {
     return this.prisma.tradeSignal.count({ where: { dateString: this.todayIso(), currentStatus: status } });
   }
 
+  /**
+   * SESSION WINDOW UPPER LIMITS — count of today's signals *opened*
+   * (`timestamp`) within a given [startMinutes, endMinutes) IST
+   * minutes-since-midnight range — the input to SignalsService's per-window
+   * entry cap (Morning/Mid-Day/Afternoon). Done in application code rather
+   * than a raw-SQL timezone EXTRACT: today's row count is always small
+   * (bounded by the daily cap), and every other IST time-of-day calculation
+   * in this codebase already goes through `getISTDateParts()` — one source
+   * of truth for the UTC+5:30 conversion instead of a second one in SQL.
+   */
+  async countTodayInWindow(startMinutes: number, endMinutes: number): Promise<number> {
+    const todaysTimestamps = await this.prisma.tradeSignal.findMany({
+      where: { dateString: this.todayIso() },
+      select: { timestamp: true },
+    });
+
+    return todaysTimestamps.filter(({ timestamp }) => {
+      const { hour, minute } = getISTDateParts(timestamp);
+      const minutesSinceMidnight = hour * 60 + minute;
+      return minutesSinceMidnight >= startMinutes && minutesSinceMidnight < endMinutes;
+    }).length;
+  }
+
   /** True if there is currently any position still being tracked. */
   async hasActivePosition(): Promise<boolean> {
     const active = await this.prisma.tradeSignal.findFirst({
@@ -79,6 +102,25 @@ export class TradesService {
   async mostRecentResolutionTime(direction: Direction): Promise<Date | null> {
     const last = await this.prisma.tradeSignal.findFirst({
       where: { direction, currentStatus: { not: TradeStatus.ACTIVE }, resolvedAt: { not: null } },
+      orderBy: { resolvedAt: 'desc' },
+      select: { resolvedAt: true },
+    });
+    return last?.resolvedAt ?? null;
+  }
+
+  /**
+   * SAME-STRIKE LOSS BLACKLIST — when this exact (strikePrice, direction)
+   * combination — e.g. 23,400 PE — most recently resolved STOPLOSS_HIT. Not
+   * restricted to today's `dateString`, same reasoning as
+   * `mostRecentResolutionTime()`. Returns null if this strike+direction has
+   * never hit its original risk stop. See SignalsService's blacklist check —
+   * a fresh setup on the SAME strike is rejected until STRIKE_BLACKLIST_MINUTES
+   * has elapsed since this timestamp, so the bot doesn't immediately
+   * re-enter the exact strike that just stopped it out in a choppy zone.
+   */
+  async mostRecentStoplossHitTime(strikePrice: number, direction: Direction): Promise<Date | null> {
+    const last = await this.prisma.tradeSignal.findFirst({
+      where: { strikePrice, direction, currentStatus: TradeStatus.STOPLOSS_HIT, resolvedAt: { not: null } },
       orderBy: { resolvedAt: 'desc' },
       select: { resolvedAt: true },
     });
