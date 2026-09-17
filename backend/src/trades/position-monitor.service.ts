@@ -390,7 +390,7 @@ export class PositionMonitorService {
   private resolveTargetRevisionThresholdPct(targetCashINR: number): number {
     if (targetCashINR >= 3000) return 0.5;
     if (targetCashINR >= 1501) return 0.6;
-    return 0.7; // covers ₹1,000–₹1,500, and any edge case below (MIN_TARGET_CASH_INR should prevent that from occurring)
+    return 0.7; // covers ₹1,000–₹1,500, and anything below it — SignalsService's dynamic min-profit filter (minTargetCashFloorINR/minTargetAtrFraction) can now admit targets as low as the ₹300 floor on a quiet-ATR day, so this tier is reached more often than before
   }
 
   /**

@@ -1,7 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { SMA, RSI, ATR } from 'technicalindicators';
 import { CandleBar, DailyLevels, IndicatorSnapshot, ReactionLevel, SeriesPoint } from '../signals/signals.types';
-import { toISTIsoDate } from '../common/ist-time.util';
+import { toISTIsoDate, getISTDateParts } from '../common/ist-time.util';
+import { SESSION_WINDOW_BOUNDS } from '../common/market-hours.util';
 
 /**
  * Wraps the `technicalindicators` library to compute the exact indicator
@@ -62,16 +63,24 @@ export class IndicatorsService {
     const atr14 = atrSeries[atrSeries.length - 1];
 
     // MARKET-MOVEMENT-FIRST — ATR expansion check. Compares the latest
-    // ATR(14) to its reading ATR_EXPANSION_LOOKBACK_BARS bars ago: rising
-    // means volatility is genuinely expanding (real movement, not flat
-    // chop). Fails open (true) when there's not yet enough ATR history for
-    // the lookback — e.g. right after a fresh boot — rather than blocking
-    // every signal until that history accumulates.
+    // ATR(14) to its reading ATR_EXPANSION_LOOKBACK_BARS bars ago as a
+    // RATIO rather than a strict boolean — a sharp move that has already
+    // happened and is now consolidating (ATR flattening or dipping a few
+    // percent off its peak) shouldn't read identically to a genuinely flat
+    // chop (ATR at half its recent level or less). SignalsService applies
+    // its own softened pass/fail threshold against this ratio; `atrExpanding`
+    // is kept as the plain >1 boolean for any caller that just wants a
+    // quick read. Fails open (ratio = 1, atrExpanding = true) when there's
+    // not yet enough ATR history for the lookback — e.g. right after a
+    // fresh boot — rather than blocking every signal until that history
+    // accumulates.
     const lookbackIndex = atrSeries.length - 1 - IndicatorsService.ATR_EXPANSION_LOOKBACK_BARS;
-    const atrExpanding = lookbackIndex >= 0 ? atr14 > atrSeries[lookbackIndex] : true;
+    const lookbackAtr = lookbackIndex >= 0 ? atrSeries[lookbackIndex] : null;
+    const atrExpansionRatio = lookbackAtr !== null && lookbackAtr > 0 ? atr14 / lookbackAtr : 1;
+    const atrExpanding = atrExpansionRatio > 1;
 
     this.logger.debug(
-      `Computed indicators — spot: ${latestCandle.close}, SMA9: ${sma9.toFixed(2)}, RSI14: ${rsi14.toFixed(2)}, ATR14: ${atr14.toFixed(2)}, atrExpanding: ${atrExpanding}`,
+      `Computed indicators — spot: ${latestCandle.close}, SMA9: ${sma9.toFixed(2)}, RSI14: ${rsi14.toFixed(2)}, ATR14: ${atr14.toFixed(2)}, atrExpansionRatio: ${atrExpansionRatio.toFixed(2)}`,
     );
 
     return {
@@ -80,8 +89,78 @@ export class IndicatorsService {
       rsi14,
       atr14,
       atrExpanding,
+      atrExpansionRatio,
       candleTimestamp: latestCandle.timestamp,
     };
+  }
+
+  /**
+   * SUSTAINED-TREND BYPASS — counts how many consecutive, most-recently-
+   * closed 5m bars (today's session only) satisfy a strict trend-agreement
+   * condition, walking backward from the latest bar:
+   *   bullish bar: close > SMA9 AND RSI14 >= 55
+   *   bearish bar: close < SMA9 AND RSI14 <= 45
+   * Deliberately the tighter, classic 55/45 threshold — not the widened
+   * RSI_MIN/RSI_MAX band `SignalsService.evaluateStrategy()` uses for entry
+   * — since this counts confirms a *sustained*, unambiguous trend, not just
+   * a single directionally-plausible reading.
+   *
+   * Recomputed fresh from the candle history every tick rather than an
+   * incrementally maintained instance counter, so a process restart, a
+   * missed cron tick, or a market-data gap can never leave a stale streak
+   * behind — the same "rebuild from source data, don't carry hidden state"
+   * approach `computeSnapshot()`'s ATR-expansion lookback already uses.
+   * Counting stops at the first bar that breaks the streak, doesn't satisfy
+   * its condition, falls outside today's session, or runs out of
+   * SMA/RSI warm-up history.
+   */
+  computeConsecutiveTrendBars(candles: CandleBar[]): { consecutiveBullishBars: number; consecutiveBearishBars: number } {
+    if (candles.length === 0) {
+      return { consecutiveBullishBars: 0, consecutiveBearishBars: 0 };
+    }
+
+    const closes = candles.map((candle) => candle.close);
+    const smaValues = SMA.calculate({ period: IndicatorsService.SMA_PERIOD, values: closes });
+    const rsiValues = RSI.calculate({ period: IndicatorsService.RSI_PERIOD, values: closes });
+    // Same right-alignment offset trick as computeSeries() — technicalindicators
+    // drops the initial lookback bars it needs, so its output is shorter
+    // than the input candle array.
+    const smaOffset = candles.length - smaValues.length;
+    const rsiOffset = candles.length - rsiValues.length;
+
+    const latestSessionDate = toISTIsoDate(candles[candles.length - 1].timestamp);
+
+    let consecutiveBullishBars = 0;
+    let consecutiveBearishBars = 0;
+    let bullishStreakBroken = false;
+    let bearishStreakBroken = false;
+
+    for (let i = candles.length - 1; i >= 0; i--) {
+      if (toISTIsoDate(candles[i].timestamp) !== latestSessionDate) break; // never count into a prior session
+
+      const sma9 = i >= smaOffset ? smaValues[i - smaOffset] : null;
+      const rsi14 = i >= rsiOffset ? rsiValues[i - rsiOffset] : null;
+      if (sma9 === null || rsi14 === null) break; // ran out of warmed-up indicator history
+
+      const isBullishBar = candles[i].close > sma9 && rsi14 >= 55;
+      const isBearishBar = candles[i].close < sma9 && rsi14 <= 45;
+
+      if (!bullishStreakBroken && isBullishBar) {
+        consecutiveBullishBars++;
+      } else {
+        bullishStreakBroken = true;
+      }
+
+      if (!bearishStreakBroken && isBearishBar) {
+        consecutiveBearishBars++;
+      } else {
+        bearishStreakBroken = true;
+      }
+
+      if (bullishStreakBroken && bearishStreakBroken) break; // neither streak can extend any further back
+    }
+
+    return { consecutiveBullishBars, consecutiveBearishBars };
   }
 
   /**
@@ -205,6 +284,15 @@ export class IndicatorsService {
    *      into one level (the cluster's average price), with `strength` =
    *      how many touches merged into it — several nearby reactions are a
    *      stronger structural level than a single touch.
+   *   3. FALLBACK levels — session VWAP and the morning-window (09:15–10:30)
+   *      high/low, both drawn from *today's* candles only. These exist so
+   *      Mid-Day's stricter `requirePivotLevel` confirmation rule (see
+   *      SignalsService.passesStructuralReactionFilter()) isn't limited to
+   *      just the four fixed daily-pivot numbers — VWAP and the opening
+   *      range are levels every intraday participant is also watching, just
+   *      as "structural" as a floor pivot, but responsive to where *today*
+   *      actually traded instead of yesterday's range. See
+   *      `computeSessionVWAP()` / `computeMorningRange()`.
    *
    * `atr14` scales the cluster tolerance to the day's actual volatility
    * (tight on a quiet day, wider on a choppy one) rather than a fixed point
@@ -235,8 +323,85 @@ export class IndicatorsService {
     // the day) collapsing every swing point into one giant cluster.
     const tolerance = Math.max(atr14 * IndicatorsService.SWING_CLUSTER_TOLERANCE_ATR_MULT, 1);
     const swingLevels = this.clusterSwingPoints(rawSwingPoints, tolerance);
+    const fallbackLevels = this.computeFallbackLevels(session);
 
-    return [...pivotLevels, ...swingLevels].sort((a, b) => a.level - b.level);
+    return [...pivotLevels, ...swingLevels, ...fallbackLevels].sort((a, b) => a.level - b.level);
+  }
+
+  /** Builds the FALLBACK reaction levels (session VWAP + morning high/low) — see `computeReactionLevels()` step 3. */
+  private computeFallbackLevels(session: CandleBar[]): ReactionLevel[] {
+    const levels: ReactionLevel[] = [];
+
+    const vwap = this.computeSessionVWAP(session);
+    if (vwap !== null) {
+      levels.push({ level: vwap, kind: 'FALLBACK', strength: 1 });
+    }
+
+    const morningRange = this.computeMorningRange(session);
+    if (morningRange !== null) {
+      levels.push({ level: morningRange.high, kind: 'FALLBACK', strength: 1 });
+      levels.push({ level: morningRange.low, kind: 'FALLBACK', strength: 1 });
+    }
+
+    return levels;
+  }
+
+  /**
+   * Session VWAP (volume-weighted average price) from today's candles so
+   * far: cumulative(typicalPrice × volume) / cumulative(volume), typical
+   * price = (H+L+C)/3. Returns `null` for an empty session.
+   *
+   * CAVEAT: Yahoo Finance reports `volume: 0` for index symbols like
+   * ^NSEI — an index has no traded volume of its own, only its constituent
+   * stocks do — so the weighted formula degenerates to 0/0 in practice.
+   * Rather than surface that as a level (or throw), this falls back to an
+   * unweighted time-average of typical price (equivalent to a "TWAP") once
+   * cumulative volume is 0, so the fallback level is still usable on an
+   * index feed instead of silently disappearing from every reaction-level
+   * set. If a genuine volume-carrying feed is ever wired in instead, the
+   * weighted branch takes over automatically.
+   */
+  private computeSessionVWAP(session: CandleBar[]): number | null {
+    if (session.length === 0) return null;
+
+    let cumulativeTypicalVolume = 0;
+    let cumulativeVolume = 0;
+    let sumTypicalPrice = 0;
+
+    for (const candle of session) {
+      const typicalPrice = (candle.high + candle.low + candle.close) / 3;
+      cumulativeTypicalVolume += typicalPrice * candle.volume;
+      cumulativeVolume += candle.volume;
+      sumTypicalPrice += typicalPrice;
+    }
+
+    if (cumulativeVolume > 0) {
+      return this.round(cumulativeTypicalVolume / cumulativeVolume);
+    }
+
+    return this.round(sumTypicalPrice / session.length); // TWAP fallback — see CAVEAT above.
+  }
+
+  /**
+   * Today's high/low over just the Morning session window (09:15–10:30
+   * IST, reused from `SESSION_WINDOW_BOUNDS` so it can't drift out of sync
+   * with SignalsService's own window boundaries). Returns `null` before
+   * any Morning-window candle exists yet (e.g. evaluating at 09:15 sharp).
+   */
+  private computeMorningRange(session: CandleBar[]): { high: number; low: number } | null {
+    const { startMinutes, endMinutes } = SESSION_WINDOW_BOUNDS.MORNING;
+    const morningCandles = session.filter((candle) => {
+      const { hour, minute } = getISTDateParts(candle.timestamp);
+      const minutesSinceMidnight = hour * 60 + minute;
+      return minutesSinceMidnight >= startMinutes && minutesSinceMidnight < endMinutes;
+    });
+
+    if (morningCandles.length === 0) return null;
+
+    return {
+      high: Math.max(...morningCandles.map((candle) => candle.high)),
+      low: Math.min(...morningCandles.map((candle) => candle.low)),
+    };
   }
 
   private dailyLevelsToReactionLevels(levels: DailyLevels): ReactionLevel[] {

@@ -35,6 +35,15 @@ export interface IndicatorSnapshot {
    * of a fresh boot. See IndicatorsService.computeSnapshot().
    */
   atrExpanding: boolean;
+  /**
+   * Raw ratio of current ATR(14) to its reading `ATR_EXPANSION_LOOKBACK_BARS`
+   * bars ago (1.0 = flat, >1 = expanding, <1 = contracting). `atrExpanding`
+   * is a hard boolean off the strict >1 case; SignalsService's expansion
+   * filter uses this ratio directly against a softened, configurable
+   * threshold (ATR_EXPANSION_MIN_RATIO) instead, so a barely-contracting
+   * read (e.g. 0.95) isn't treated the same as a flat chop (e.g. 0.5).
+   */
+  atrExpansionRatio: number;
   candleTimestamp: Date;
 }
 
@@ -85,8 +94,15 @@ export interface DailyLevels {
  */
 export interface ReactionLevel {
   level: number;
-  kind: 'PIVOT' | 'SWING';
-  /** Touch count for a SWING cluster (how many local swing points merged into it); always 1 for a PIVOT level. */
+  /**
+   * 'FALLBACK' — session VWAP and the morning (09:15–10:30) high/low,
+   * added so Mid-Day's stricter confirmation rule has a widely-watched
+   * intraday reference to react off of even on days where price never gets
+   * near one of the four fixed daily-pivot numbers. See
+   * `IndicatorsService.computeReactionLevels()`.
+   */
+  kind: 'PIVOT' | 'SWING' | 'FALLBACK';
+  /** Touch count for a SWING cluster (how many local swing points merged into it); always 1 for a PIVOT/FALLBACK level. */
   strength: number;
 }
 
@@ -177,4 +193,14 @@ export interface SignalData {
   /** True while an ACTIVE persisted position is already being tracked — a
    *  fresh strategy read won't open a second one until it resolves. */
   hasActivePosition: boolean;
+  /**
+   * FILTER-LEVEL AUDIT TRAIL — one line per confirmation filter this tick
+   * evaluated (directional read, ATR expansion, structural reaction,
+   * min-profit, cooldown, blacklist, session cap), each tagged PASS/REJECT
+   * plus the numbers behind that call. Populated on every tick, not just
+   * rejections, so "why didn't this fire" and "why DID this fire" are both
+   * answerable from the API response instead of grepping server logs. See
+   * SignalsService.refreshSignal().
+   */
+  rejectionTrace: string[];
 }
