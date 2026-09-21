@@ -1,11 +1,27 @@
-import { TradeSignal } from './trade-signal';
+import { DELTA_PROXY, LOT_SIZE, TradeSignal } from './trade-signal';
 import { playLossChime, playWinChime } from './sound';
 
-/** The desk's risk-protocol constants at the moment a signal was created — sourced from GET /api/signals/latest's tradeRules. */
-export interface RiskConfig {
-  lotSize: number;
-  maxRiskCashINR: number;
-  targetCashINR: number;
+/**
+ * Risk-protocol cash figures for a specific trade, derived directly from
+ * its own persisted entry/stop-loss/target spot prices — NOT from the
+ * live /latest signal's `tradeRules` (that was the previous approach; see
+ * the removed `RiskConfig` prop-drilling this replaced). `tradeRules` is
+ * null whenever the CURRENT live strategy read is NO_SIGNAL, which — with
+ * the entry filters tightened as far as they now are — is true the vast
+ * majority of the time. A notification gated on that value would silently
+ * never fire unless the frontend's poll happened to land on the exact
+ * tick a trade was created, which is unreliable. Deriving these figures
+ * from the trade's own row instead makes the notification self-contained
+ * and correct regardless of what the live signal happens to read right now.
+ */
+function deriveRiskConfig(signal: TradeSignal): { lotSize: number; maxRiskCashINR: number; targetCashINR: number } {
+  const optionStopLossPoints = Math.abs(signal.entrySpotPrice - signal.stopLossSpot) * DELTA_PROXY;
+  const optionTargetPoints = Math.abs(signal.targetSpot - signal.entrySpotPrice) * DELTA_PROXY;
+  return {
+    lotSize: LOT_SIZE,
+    maxRiskCashINR: Math.round(optionStopLossPoints * LOT_SIZE),
+    targetCashINR: Math.round(optionTargetPoints * LOT_SIZE),
+  };
 }
 
 /** Returns true when the Notification API exists in this browser. */
@@ -49,12 +65,13 @@ function expiryShortLabel(expiryType: TradeSignal['expiryType']): 'CURRENT' | 'N
  * each row is created exactly once. Deliberately does NOT set
  * `silent: true`, so the OS plays its standard default alert sound.
  */
-export function notifyNewEntry(signal: TradeSignal, risk: RiskConfig): void {
+export function notifyNewEntry(signal: TradeSignal): void {
   if (!isNotificationSupported() || Notification.permission !== 'granted') {
     return;
   }
 
   try {
+    const risk = deriveRiskConfig(signal);
     const body =
       `BUY NIFTY ${signal.strikePrice} ${optionLabel(signal.direction)} (${expiryShortLabel(signal.expiryType)} Expiry) | 1 Lot (${risk.lotSize} units)\n` +
       `Max Risk: -₹${risk.maxRiskCashINR.toLocaleString('en-IN')} | Target: +₹${risk.targetCashINR.toLocaleString('en-IN')}`;

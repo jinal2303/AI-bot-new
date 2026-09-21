@@ -42,11 +42,12 @@ when nothing is currently `ACTIVE`. **ATM strike** = spot rounded to the nearest
 
 | Day                          | Expiry target  |
 |-------------------------------|----------------|
-| Friday, Monday, Tuesday       | `CURRENT_WEEK` |
-| Wednesday, Thursday           | `NEXT_WEEK` (dodges the terminal Theta cliff) |
+| Wednesday, Thursday, Friday   | `CURRENT_WEEK` |
+| Monday, Tuesday (expiry day)  | `NEXT_WEEK` (dodges the terminal Theta cliff) |
 
-[expiry.service.ts](backend/src/expiry/expiry.service.ts) — a pure day-of-week lookup, no
-external data needed.
+Nifty's weekly expiry is **Tuesday**. [expiry.service.ts](backend/src/expiry/expiry.service.ts)
+derives the cycle from the days left until that expiry (current week only while at least
+2 days of runway remain) — no external data needed.
 
 ---
 
@@ -447,5 +448,5 @@ alerts (and Telegram alerts too, if configured).
 - Entry-time exit sizing is volatility-based (`ATR_TARGET_MULTIPLIER` / `ATR_STOPLOSS_MULTIPLIER`, default 2:1), not a fixed point count. Post-entry, the trailing-stop and stale-exit rules keep adjusting `stopLossSpot`/`targetSpot` live — see [position-monitor.service.ts](backend/src/trades/position-monitor.service.ts).
 - `MAX_DAILY_SIGNALS` is clamped to `[5, 10]` in code regardless of `.env` — a misconfiguration can't silently disable the overtrading guard.
 - There is no forced end-of-day square-off — a position that never hits target/stop-loss/trailing-stop simply stays `ACTIVE` and rolls into the next session (the frontend's Intraday/Delivery tag and Carry Advisory reflect this reality rather than hiding it).
-- NSE's weekly-expiry weekday (`EXPIRY_WEEKDAY` in `expiry.service.ts`, default Thursday) and market hours (`market-hours.util.ts`) are single named constants to update if the exchange revises them; Indian market holidays are not accounted for.
+- NSE's weekly-expiry weekday (`EXPIRY_WEEKDAY` in `expiry.service.ts`, currently Tuesday) and market hours (`market-hours.util.ts`) are single named constants to update if the exchange revises them; Indian market holidays are not accounted for.
 - This is an educational/demo signal engine, not investment advice — validate independently before trading on it.

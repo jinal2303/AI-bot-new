@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { WS_BASE_URL } from '@/lib/api';
-import { notifyExit, notifyNewEntry, RiskConfig } from '@/lib/notifications';
+import { notifyExit, notifyNewEntry } from '@/lib/notifications';
 import { SignalStatusChangedPayload, TradeSignal } from '@/lib/trade-signal';
 
 export interface ExitToastItem extends SignalStatusChangedPayload {
@@ -11,8 +11,6 @@ export interface ExitToastItem extends SignalStatusChangedPayload {
 }
 
 export interface UseTradeSocketOptions {
-  /** Risk-protocol constants (from /latest's tradeRules) needed to render the entry-notification body. */
-  riskConfig: RiskConfig | null;
   /** Called the instant a fresh signal is persisted, so the caller can upsert it into its today's-signals list. */
   onSignalCreated?: (signal: TradeSignal) => void;
   /** Called the instant an ACTIVE position resolves, so the caller can upsert the update into its list. */
@@ -36,11 +34,9 @@ export interface UseTradeSocketResult {
  *    desktop exit notification + audio chime and pushes an in-app toast
  *    (the "Live Exit Popup").
  */
-export function useTradeSocket({ riskConfig, onSignalCreated, onStatusChange }: UseTradeSocketOptions): UseTradeSocketResult {
+export function useTradeSocket({ onSignalCreated, onStatusChange }: UseTradeSocketOptions): UseTradeSocketResult {
   const [connected, setConnected] = useState(false);
   const [toasts, setToasts] = useState<ExitToastItem[]>([]);
-  const riskConfigRef = useRef(riskConfig);
-  riskConfigRef.current = riskConfig;
   const onSignalCreatedRef = useRef(onSignalCreated);
   onSignalCreatedRef.current = onSignalCreated;
   const onStatusChangeRef = useRef(onStatusChange);
@@ -57,9 +53,7 @@ export function useTradeSocket({ riskConfig, onSignalCreated, onStatusChange }: 
     });
 
     socket.on('signal-created', (payload: { signal: TradeSignal }) => {
-      if (riskConfigRef.current) {
-        notifyNewEntry(payload.signal, riskConfigRef.current);
-      }
+      notifyNewEntry(payload.signal);
       onSignalCreatedRef.current?.(payload.signal);
     });
 

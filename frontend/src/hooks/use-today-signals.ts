@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchTodaySignals } from '@/lib/api';
-import { notifyNewEntry, RiskConfig } from '@/lib/notifications';
+import { notifyNewEntry } from '@/lib/notifications';
 import { TradeSignal } from '@/lib/trade-signal';
 
 const POLL_INTERVAL_MS = 5_000;
@@ -24,7 +24,7 @@ export interface UseTodaySignalsResult {
  * with an id we haven't seen yet appears — since each TradeSignal row is
  * created exactly once, a new id unambiguously means a new signal event.
  */
-export function useTodaySignals(riskConfig: RiskConfig | null): UseTodaySignalsResult {
+export function useTodaySignals(): UseTodaySignalsResult {
   const [signals, setSignals] = useState<TradeSignal[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -33,8 +33,6 @@ export function useTodaySignals(riskConfig: RiskConfig | null): UseTodaySignalsR
   // The first successful fetch establishes a baseline — rows already on the
   // board when the dashboard opens shouldn't fire a "new" notification.
   const hasBaseline = useRef(false);
-  const riskConfigRef = useRef(riskConfig);
-  riskConfigRef.current = riskConfig;
 
   const poll = useCallback(async () => {
     try {
@@ -48,10 +46,7 @@ export function useTodaySignals(riskConfig: RiskConfig | null): UseTodaySignalsR
 
       if (hasBaseline.current) {
         const freshRows = data.filter((row) => !seenIds.current.has(row.id));
-        const risk = riskConfigRef.current;
-        if (risk) {
-          freshRows.forEach((row) => notifyNewEntry(row, risk));
-        }
+        freshRows.forEach((row) => notifyNewEntry(row));
       }
 
       data.forEach((row) => seenIds.current.add(row.id));

@@ -15,7 +15,6 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { useSignalPolling } from '@/hooks/use-signal-polling';
 import { useTodaySignals } from '@/hooks/use-today-signals';
 import { useTradeSocket } from '@/hooks/use-trade-socket';
-import { RiskConfig } from '@/lib/notifications';
 import { carryRecommendation } from '@/lib/trade-signal';
 
 export default function DashboardPage() {
@@ -26,15 +25,8 @@ export default function DashboardPage() {
     setPermission(notificationPermission);
   }, [notificationPermission]);
 
-  const riskConfig: RiskConfig | null = useMemo(() => {
-    if (!signal?.tradeRules) return null;
-    const { lotSize, maxRiskCashINR, targetCashINR } = signal.tradeRules;
-    return { lotSize, maxRiskCashINR, targetCashINR };
-  }, [signal?.tradeRules]);
-
-  const { signals: todaySignals, error: todayError, upsertSignal } = useTodaySignals(riskConfig);
+  const { signals: todaySignals, error: todayError, upsertSignal } = useTodaySignals();
   const { toasts, dismissToast } = useTradeSocket({
-    riskConfig,
     onSignalCreated: upsertSignal,
     onStatusChange: (payload) => upsertSignal(payload.signal),
   });
@@ -137,7 +129,7 @@ export default function DashboardPage() {
       <footer className="mt-10 border-t border-border pt-6 text-xs text-muted-foreground">
         <p>
           Strategy: BUY CALL (CE) when Spot &gt; SMA(9) and 55 ≤ RSI(14) ≤ 65. BUY PUT (PE) when Spot
-          &lt; SMA(9) and 35 ≤ RSI(14) ≤ 45. Expiry: Fri/Mon/Tue → Current Week, Wed/Thu → Next Week.
+          &lt; SMA(9) and 35 ≤ RSI(14) ≤ 45. Expiry (Tuesday weekly): Wed/Thu/Fri → Current Week, Mon/Tue → Next Week.
           Risk (1 lot, 65 units, Δ 0.5 proxy): stop-loss/target scale with ATR(14) volatility, not a fixed
           point count. Max {signal?.maxDailySignals ?? 10} signals/day. Data source: Yahoo Finance (^NSEI, 5m
           candles). Educational use only — not investment advice.

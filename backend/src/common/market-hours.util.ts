@@ -41,22 +41,23 @@ export function minutesUntilMarketClose(date: Date = new Date()): number {
 // named intraday window — a supplementary throttle to the overall daily
 // cap, independent of it. Deliberately named/scoped separately from
 // MARKET_OPEN_MINUTES/MARKET_CLOSE_MINUTES above: the three windows span
-// 09:15-15:15, not the full 09:15-15:30 market-open range — the final 15
-// minutes are reserved for the mandatory EOD square-off only, no new
-// entries. See SignalsService's session-window-cap filter.
+// 09:15-14:30 (cut off early, per desk request 2026-09-17 — no new trades
+// in the final ~an-hour stretch into close), not the full 09:15-15:30
+// market-open range. See SignalsService's session-window-cap filter.
 export type SessionWindow = 'MORNING' | 'MIDDAY' | 'AFTERNOON';
 
 /** [startInclusive, endExclusive) minutes-since-midnight IST boundaries for each named window. */
 export const SESSION_WINDOW_BOUNDS: Record<SessionWindow, { startMinutes: number; endMinutes: number }> = {
   MORNING: { startMinutes: 9 * 60 + 15, endMinutes: 10 * 60 + 30 }, // 09:15–10:30
   MIDDAY: { startMinutes: 10 * 60 + 30, endMinutes: 13 * 60 + 15 }, // 10:30–13:15
-  AFTERNOON: { startMinutes: 13 * 60 + 15, endMinutes: 15 * 60 + 15 }, // 13:15–15:15
+  AFTERNOON: { startMinutes: 13 * 60 + 15, endMinutes: 14 * 60 + 30 }, // 13:15–14:30
 };
 
 /**
  * Which named session window `date` (defaults to now) falls in, or `null`
- * outside all three — pre-open, or the 15:15–15:30 EOD-only tail where no
- * new entries are allowed regardless of any window's remaining headroom.
+ * outside all three — pre-open, or past 14:30 IST (no new entries for the
+ * rest of the day, regardless of any window's remaining headroom; existing
+ * open positions are still tracked and squared off as usual at EOD).
  */
 export function getSessionWindow(date: Date = new Date()): SessionWindow | null {
   const { hour, minute } = getISTDateParts(date);

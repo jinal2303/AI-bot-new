@@ -64,15 +64,34 @@ export class SignalsService {
    * exceeded regardless of configured value.
    */
   private readonly maxDailyStoplossHits: number;
+  /**
+   * SAFETY CAP — daily loss circuit breaker (total), tighter and broader
+   * than maxDailyStoplossHits above: trips once this many of TODAY's
+   * resolved trades closed with a negative netCashINR, at ANY terminal
+   * status (not just STOPLOSS_HIT — a TIME_EXIT can also close negative).
+   * See TradesService.countTodayLosses().
+   */
+  private readonly maxDailyLosses: number;
+  /**
+   * SAFETY CAP — daily loss circuit breaker (consecutive). Trips once this
+   * many of today's MOST RECENT resolutions, in an unbroken streak, are
+   * STOPLOSS_HIT — a TARGET_HIT/TRAIL_STOP_HIT in between resets the
+   * streak. Catches a "cold streak" fast, before it necessarily reaches
+   * the total-loss or stop-loss-count ceilings above. See
+   * TradesService.consecutiveStoplossHits().
+   */
+  private readonly maxConsecutiveLosses: number;
   /** TESTING MODE — see the `ENABLE_DAILY_LIMIT` module constant above for what this gates. */
   private readonly enableDailyLimit: boolean;
 
   /**
-   * RE-ENTRY COOLDOWN GUARD — after ANY trade resolves (TARGET_HIT /
-   * TRAIL_STOP_HIT / STOPLOSS_HIT / TIME_EXIT), a fresh setup in that
-   * *same* direction is rejected for this many minutes, to stop rapid
-   * overtrading back-to-back in one direction. See the cooldown check in
-   * `refreshSignal()` and `TradesService.mostRecentResolutionTime()`.
+   * GLOBAL LOSS COOLDOWN GUARD (refactored 2026-09-17 from a per-direction,
+   * any-outcome cooldown) — after a trade resolves at a LOSS (negative
+   * netCashINR, any status), fresh entries in BOTH directions are rejected
+   * for this many minutes. A win no longer triggers any cooldown — only a
+   * loss does, and it now blocks CALL and PUT alike, not just re-entry in
+   * the same direction the loss happened in. See the cooldown check in
+   * `refreshSignal()` and `TradesService.mostRecentLossTime()`.
    * Independent of `enableDailyLimit` — this guard stays active in testing
    * mode too, since it's a re-entry throttle, not a daily cap.
    */
@@ -166,6 +185,25 @@ export class SignalsService {
   /** Absolute ATR14 floor (index points) that bypasses the expansion-ratio check entirely — if volatility is already this high in absolute terms, real movement is self-evidently underway regardless of the recent trend in ATR itself. */
   private readonly atrBaselinePoints: number;
 
+  // --- MARKET REGIME / CHOP FILTER (added 2026-09-17) ----------------------
+  /**
+   * Minimum ADX(14) to treat the market as trending strongly enough to
+   * chase directionally — below this, price is range-bound/choppy
+   * regardless of what the RSI/SMA read says. Requires BOTH this AND the
+   * Choppiness Index ceiling below to clear (tightened from OR 2026-09-18
+   * — OR let borderline setups through on just one weak reading, e.g.
+   * ADX failing but Choppiness barely scraping under its ceiling; a real
+   * trade that slipped through exactly that way only peaked 1.5pts
+   * favorable before reversing).
+   */
+  private readonly adxThreshold: number;
+  /**
+   * Maximum Choppiness Index(14) — above this, price spent the period
+   * oscillating without covering net ground (textbook chop). Ranges 0-100;
+   * 60 is the classic "getting choppy" line most chart platforms mark.
+   */
+  private readonly choppinessIndexMax: number;
+
   /**
    * SUSTAINED-TREND BYPASS — a second way to clear the structural-reaction
    * filter, alongside the level-touch check (`passesStructuralReactionFilter()`).
@@ -212,13 +250,25 @@ export class SignalsService {
     // ceiling/floor reasoning as maxDailySignals above.
     this.maxDailyStoplossHits = Math.min(4, Math.max(1, Number.isFinite(configuredMaxStoplossHits) ? configuredMaxStoplossHits : 4));
 
+    const configuredMaxDailyLosses = Number(this.configService.get<string>('MAX_DAILY_LOSSES', '3'));
+    // SAFETY CAP — hard-capped at 10 (same ceiling as maxDailySignals — it
+    // can never usefully exceed the number of trades taken), floor 1.
+    this.maxDailyLosses = Math.min(10, Math.max(1, Number.isFinite(configuredMaxDailyLosses) ? configuredMaxDailyLosses : 3));
+
+    const configuredMaxConsecutiveLosses = Number(this.configService.get<string>('MAX_CONSECUTIVE_LOSSES', '2'));
+    // SAFETY CAP — hard-capped at 5, floor 1.
+    this.maxConsecutiveLosses = Math.min(
+      5,
+      Math.max(1, Number.isFinite(configuredMaxConsecutiveLosses) ? configuredMaxConsecutiveLosses : 2),
+    );
+
     // TESTING MODE — env override wins when set; otherwise falls back to the
     // ENABLE_DAILY_LIMIT constant at the top of this file.
     const dailyLimitOverride = this.configService.get<string>('ENABLE_DAILY_LIMIT');
     this.enableDailyLimit = dailyLimitOverride !== undefined ? dailyLimitOverride === 'true' : ENABLE_DAILY_LIMIT;
     if (!this.enableDailyLimit) {
       this.logger.warn(
-        `⚠️  TESTING MODE: daily ${this.maxDailySignals}-trade cap and ${this.maxDailyStoplossHits}-stoploss kill switch are DISABLED (ENABLE_DAILY_LIMIT=false). Re-enable before trading live capital.`,
+        `⚠️  TESTING MODE: daily ${this.maxDailySignals}-trade cap, ${this.maxDailyStoplossHits}-stoploss kill switch, ${this.maxDailyLosses}-total-loss and ${this.maxConsecutiveLosses}-consecutive-loss circuit breakers are ALL DISABLED (ENABLE_DAILY_LIMIT=false). Re-enable before trading live capital.`,
       );
     }
 
@@ -268,7 +318,17 @@ export class SignalsService {
     // just elevated) relative to ~30 min ago, favoring setups more likely to
     // keep running.
     this.atrExpansionMinRatio = Number(this.configService.get<string>('ATR_EXPANSION_MIN_RATIO', '1.05'));
-    this.atrBaselinePoints = Number(this.configService.get<string>('ATR_BASELINE_POINTS', '12'));
+    // Raised from 12 to 18 (2026-09-18) — ATR14 has been running ~15-21pts
+    // lately, so a 12pt baseline was almost always cleared regardless of
+    // whether volatility was genuinely expanding, making the ratio-expansion
+    // check above nearly irrelevant on most days. 18 sits closer to the
+    // actual recent range, so the baseline bypass only fires when ATR is
+    // genuinely elevated, not just "normal for this market lately".
+    this.atrBaselinePoints = Number(this.configService.get<string>('ATR_BASELINE_POINTS', '18'));
+
+    // MARKET REGIME / CHOP FILTER
+    this.adxThreshold = Number(this.configService.get<string>('ADX_THRESHOLD', '20'));
+    this.choppinessIndexMax = Number(this.configService.get<string>('CHOPPINESS_INDEX_MAX', '60'));
 
     // SUSTAINED-TREND BYPASS
     this.sustainedTrendMinBars = Number(this.configService.get<string>('SUSTAINED_TREND_MIN_BARS', '3'));
@@ -325,20 +385,31 @@ export class SignalsService {
 
     try {
       // --- Daily overtrading guard + loss circuit breaker -----------------
-      // Both checked BEFORE any indicator work — either one tripped skips
+      // All checked BEFORE any indicator work — any one tripped skips
       // the Yahoo Finance call entirely, not just the trade-creation step.
-      // TESTING MODE: dailyLimitReached/lossCircuitBreakerTripped are still
-      // computed for the dashboard either way — `enableDailyLimit` only
-      // gates whether either one actually halts evaluation below.
+      // TESTING MODE: every count/tripped flag below is still computed for
+      // the dashboard either way — `enableDailyLimit` only gates whether
+      // any of them actually halts evaluation below.
       const dailySignalCount = await this.tradesService.countToday();
       const stoplossHitCount = await this.tradesService.countTodayByStatus(TradeStatus.STOPLOSS_HIT);
+      // Added 2026-09-17: two additional, tighter loss circuit breakers —
+      // see the maxDailyLosses/maxConsecutiveLosses field docs above.
+      const dailyLossCount = await this.tradesService.countTodayLosses();
+      const consecutiveStoplossHits = await this.tradesService.consecutiveStoplossHits();
       const dailyLimitReached = dailySignalCount >= this.maxDailySignals;
-      const lossCircuitBreakerTripped = stoplossHitCount >= this.maxDailyStoplossHits;
+      const stoplossCircuitTripped = stoplossHitCount >= this.maxDailyStoplossHits;
+      const dailyLossCircuitTripped = dailyLossCount >= this.maxDailyLosses;
+      const consecutiveLossCircuitTripped = consecutiveStoplossHits >= this.maxConsecutiveLosses;
+      const lossCircuitBreakerTripped = stoplossCircuitTripped || dailyLossCircuitTripped || consecutiveLossCircuitTripped;
 
       if (this.enableDailyLimit && (dailyLimitReached || lossCircuitBreakerTripped)) {
-        const reason = lossCircuitBreakerTripped
-          ? `Daily loss circuit breaker tripped (${stoplossHitCount}/${this.maxDailyStoplossHits} stop-losses hit)`
-          : `Daily signal limit reached (${dailySignalCount}/${this.maxDailySignals})`;
+        const reason = consecutiveLossCircuitTripped
+          ? `Consecutive-loss circuit breaker tripped (${consecutiveStoplossHits}/${this.maxConsecutiveLosses} stop-losses in a row)`
+          : dailyLossCircuitTripped
+            ? `Daily total-loss circuit breaker tripped (${dailyLossCount}/${this.maxDailyLosses} losing trades today)`
+            : stoplossCircuitTripped
+              ? `Daily stop-loss circuit breaker tripped (${stoplossHitCount}/${this.maxDailyStoplossHits} stop-losses hit)`
+              : `Daily signal limit reached (${dailySignalCount}/${this.maxDailySignals})`;
         trace.push(`DAILY_HALT: REJECT — ${reason}`);
         this.logger.warn(`${reason} — halting evaluation until tomorrow.`);
         this.latestSignal = this.latestSignal
@@ -402,6 +473,56 @@ export class SignalsService {
             `ATR_EXPANSION: REJECT — ${signal} — ratio=${snapshot.atrExpansionRatio.toFixed(2)} < min ${this.atrExpansionMinRatio} AND atr14=${snapshot.atr14.toFixed(2)} < baseline ${this.atrBaselinePoints}`,
           );
           this.logger.debug(`Signal downgraded to NO_SIGNAL — ${signal} lacks ATR expansion (no real market movement underway)`);
+          signal = 'NO_SIGNAL';
+          optionType = null;
+        }
+      }
+
+      // --- MARKET REGIME / CHOP FILTER (added 2026-09-17) ------------------
+      // ATR expansion above only measures whether volatility is present —
+      // it says nothing about whether that volatility is DIRECTIONAL. A
+      // choppy back-and-forth session can carry a perfectly respectable
+      // ATR while still being a terrible environment for a directional
+      // entry. Two independent ways to pass, either is enough:
+      //   1. ADX(14) >= adxThreshold (default 20) — classic trend-strength
+      //      reading, direction-agnostic.
+      //   2. Choppiness Index(14) <= choppinessIndexMax (default 60) —
+      //      low reading means price covered real net ground over the
+      //      period rather than oscillating in place.
+      // Both `computeADX()`/`computeChoppinessIndex()` return `null` (fail
+      // open — PASS) when there isn't yet enough candle history, same
+      // cold-start convention as `atrExpanding`. NOTE: an equivalent
+      // "current volume >= 1.5x its 20-period SMA" gate was deliberately
+      // NOT implemented — Yahoo Finance reports volume=0 for the ^NSEI
+      // index (confirmed live; indices have no traded volume of their
+      // own), so that comparison would be a permanent 0-vs-0 no-op, not a
+      // real filter. See docs/SIGNAL_TRIGGER_LOGIC.md.
+      if (signal !== 'NO_SIGNAL') {
+        const adx14 = this.indicatorsService.computeADX(candles);
+        const choppinessIndex14 = this.indicatorsService.computeChoppinessIndex(candles);
+        const adxPass = adx14 === null || adx14 >= this.adxThreshold;
+        const chopPass = choppinessIndex14 === null || choppinessIndex14 <= this.choppinessIndexMax;
+
+        // Tightened 2026-09-18: was OR (either alone was enough), which let
+        // through borderline setups passing on just one weak reading — e.g.
+        // adx14=12.4 (failed) but chop14=58.8, barely under the 60 ceiling,
+        // still passed the whole gate. That exact trade only peaked 1.5pts
+        // favorable before reversing. Now requires BOTH — real trend
+        // strength AND low chop, not either alone. Each side still fails
+        // open (treated as passing) on its own if there isn't enough
+        // history yet, same cold-start convention as elsewhere, but a real
+        // failing reading on either side now blocks regardless of the other.
+        if (adxPass && chopPass) {
+          trace.push(
+            `MARKET_REGIME: PASS — adx14=${adx14 === null ? 'n/a (cold-start)' : adx14.toFixed(1)} (min ${this.adxThreshold}${adxPass ? ', met' : ' — missed'}) chop14=${choppinessIndex14 === null ? 'n/a (cold-start)' : choppinessIndex14.toFixed(1)} (max ${this.choppinessIndexMax}${chopPass ? ', met' : ' — missed'})`,
+          );
+        } else {
+          trace.push(
+            `MARKET_REGIME: REJECT — ${signal} — adx14=${adx14 === null ? 'n/a' : adx14.toFixed(1)} (min ${this.adxThreshold}, ${adxPass ? 'met' : 'missed'}) chop14=${choppinessIndex14 === null ? 'n/a' : choppinessIndex14.toFixed(1)} (max ${this.choppinessIndexMax}, ${chopPass ? 'met' : 'missed'}) — needs BOTH`,
+          );
+          this.logger.debug(
+            `Signal downgraded to NO_SIGNAL — ${signal} lacks trend strength (adx14=${adx14?.toFixed(1)}, chop14=${choppinessIndex14?.toFixed(1)})`,
+          );
           signal = 'NO_SIGNAL';
           optionType = null;
         }
@@ -489,30 +610,28 @@ export class SignalsService {
         }
       }
 
-      // --- RE-ENTRY COOLDOWN GUARD (15 minutes) ---------------------------
-      // Blocks rapid overtrading in the same direction (e.g. three PUT
-      // trades back-to-back within 18 minutes): once a trade in a given
-      // direction has resolved (any terminal status), a fresh setup in that
-      // *same* direction is downgraded to NO_SIGNAL until reentryCooldownMinutes
-      // has elapsed since that resolution. The opposite direction is
-      // unaffected — only same-direction re-entry is throttled.
+      // --- GLOBAL LOSS COOLDOWN GUARD (15 minutes, refactored 2026-09-17) --
+      // Was: same-direction-only, triggered by ANY resolution (win or
+      // loss). Now: once ANY trade resolves at a LOSS (negative
+      // netCashINR, regardless of status or direction), BOTH directions
+      // are downgraded to NO_SIGNAL until reentryCooldownMinutes has
+      // elapsed since that loss. A win no longer triggers any cooldown —
+      // only a loss does, and it now blocks CALL and PUT alike instead of
+      // just re-entry in the same direction the loss happened in.
       if (optionType !== null && tradeRules !== null) {
-        const desiredDirection = optionType === 'CE' ? Direction.CALL : Direction.PUT;
-        const lastResolvedAt = await this.tradesService.mostRecentResolutionTime(desiredDirection);
+        const lastLossAt = await this.tradesService.mostRecentLossTime();
         const cooldownMs = this.reentryCooldownMinutes * 60_000;
-        const elapsedMs = lastResolvedAt ? Date.now() - lastResolvedAt.getTime() : Infinity;
+        const elapsedMs = lastLossAt ? Date.now() - lastLossAt.getTime() : Infinity;
 
         if (elapsedMs < cooldownMs) {
           const remainingMinutes = ((cooldownMs - elapsedMs) / 60_000).toFixed(1);
-          trace.push(`REENTRY_COOLDOWN: REJECT — ${desiredDirection} — ${remainingMinutes}m remaining of ${this.reentryCooldownMinutes}m`);
-          this.logger.debug(
-            `Signal downgraded to NO_SIGNAL — ${desiredDirection} re-entry cooldown active (${remainingMinutes}m remaining)`,
-          );
+          trace.push(`GLOBAL_LOSS_COOLDOWN: REJECT — ${remainingMinutes}m remaining of ${this.reentryCooldownMinutes}m since last loss`);
+          this.logger.debug(`Signal downgraded to NO_SIGNAL — global loss cooldown active (${remainingMinutes}m remaining)`);
           signal = 'NO_SIGNAL';
           optionType = null;
           tradeRules = null;
         } else {
-          trace.push(`REENTRY_COOLDOWN: PASS — ${desiredDirection}`);
+          trace.push('GLOBAL_LOSS_COOLDOWN: PASS');
         }
       }
 
@@ -547,15 +666,18 @@ export class SignalsService {
       // A supplementary throttle to the overall daily cap: how many NEW
       // positions have already been opened within the *current* named
       // window (Morning 09:15–10:30 max 4 / Mid-Day 10:30–13:15 max 2 /
-      // Afternoon 13:15–15:15 max 4)? A window with 0 qualifying setups
+      // Afternoon 13:15–14:30 max 4)? A window with 0 qualifying setups
       // simply takes 0 trades — this only ever blocks, never fills, a
-      // window's remaining headroom. Outside all three windows (the
-      // 15:15–15:30 EOD-only tail) no new entries are allowed at all,
-      // regardless of the daily/window counts.
+      // window's remaining headroom. Outside all three windows (past 14:30
+      // IST — no new trades for the rest of the day, per desk request
+      // 2026-09-17) no new entries are allowed at all, regardless of the
+      // daily/window counts. Existing open positions are unaffected — the
+      // position monitor keeps tracking/exiting them as usual, including
+      // the mandatory EOD square-off at 15:15.
       if (optionType !== null && tradeRules !== null) {
         if (currentWindow === null) {
-          trace.push('SESSION_WINDOW_CAP: REJECT — outside every session window (past 15:15 IST, EOD square-off only)');
-          this.logger.debug('Signal downgraded to NO_SIGNAL — outside every session window (past 15:15 IST, EOD square-off only)');
+          trace.push('SESSION_WINDOW_CAP: REJECT — outside every session window (past 14:30 IST — no new trades today)');
+          this.logger.debug('Signal downgraded to NO_SIGNAL — outside every session window (past 14:30 IST — no new trades today)');
           signal = 'NO_SIGNAL';
           optionType = null;
           tradeRules = null;

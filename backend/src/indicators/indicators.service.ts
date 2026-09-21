@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { SMA, RSI, ATR } from 'technicalindicators';
+import { SMA, RSI, ATR, ADX, TrueRange } from 'technicalindicators';
 import { CandleBar, DailyLevels, IndicatorSnapshot, ReactionLevel, SeriesPoint } from '../signals/signals.types';
 import { toISTIsoDate, getISTDateParts } from '../common/ist-time.util';
 import { SESSION_WINDOW_BOUNDS } from '../common/market-hours.util';
@@ -17,6 +17,11 @@ export class IndicatorsService {
   private static readonly SMA_PERIOD = 9;
   private static readonly RSI_PERIOD = 14;
   private static readonly ATR_PERIOD = 14;
+  // MARKET REGIME / CHOP FILTER — ADX needs roughly 2x its period of bars
+  // before the double-smoothed reading stabilizes (unlike SMA/RSI/ATR,
+  // which only need `period` bars) — see computeADX()'s fail-open guard.
+  private static readonly ADX_PERIOD = 14;
+  private static readonly CHOPPINESS_PERIOD = 14;
 
   // --- PIVOT & STRUCTURE REACTION ANALYSIS ------------------------------------
   /** Bars on each side that must be less-extreme for a candle's high/low to confirm as a local swing point. */
@@ -92,6 +97,64 @@ export class IndicatorsService {
       atrExpansionRatio,
       candleTimestamp: latestCandle.timestamp,
     };
+  }
+
+  /**
+   * MARKET REGIME / CHOP FILTER — Average Directional Index(14), the
+   * classic Wilder trend-strength read (direction-agnostic: a strong
+   * downtrend reads just as high as a strong uptrend). Returns `null`
+   * rather than throwing when there isn't yet enough history for the
+   * double-smoothed calculation to have stabilized (needs roughly 2x
+   * ADX_PERIOD bars, unlike the single-smoothed SMA/RSI/ATR above) — the
+   * caller (SignalsService) treats `null` as "fail open, don't block on
+   * cold-start history" the same way `atrExpanding` already does.
+   */
+  computeADX(candles: CandleBar[]): number | null {
+    const minimumBars = IndicatorsService.ADX_PERIOD * 2;
+    if (candles.length < minimumBars) return null;
+
+    const high = candles.map((candle) => candle.high);
+    const low = candles.map((candle) => candle.low);
+    const close = candles.map((candle) => candle.close);
+
+    const result = ADX.calculate({ period: IndicatorsService.ADX_PERIOD, high, low, close });
+    if (result.length === 0) return null;
+
+    return result[result.length - 1].adx;
+  }
+
+  /**
+   * MARKET REGIME / CHOP FILTER — Choppiness Index(14): 100 x log10(sum of
+   * True Range over the period / (highest high - lowest low over the same
+   * period)) / log10(period). Ranges 0-100; high readings (>60, the
+   * strategy's default ceiling) mean price spent the period oscillating
+   * without covering much net ground — textbook chop, the exact condition
+   * a directional entry should avoid regardless of what the SMA/RSI read
+   * says. Returns `null` (fails open, same convention as computeADX())
+   * when there isn't enough history, or when the high-low range is exactly
+   * zero (a dead/flat tape — can't divide by it; also not a scenario worth
+   * hard-blocking on, since it should never happen on real market data).
+   */
+  computeChoppinessIndex(candles: CandleBar[]): number | null {
+    const period = IndicatorsService.CHOPPINESS_PERIOD;
+    if (candles.length < period + 1) return null;
+
+    const recent = candles.slice(-period);
+    const trueRanges = TrueRange.calculate({
+      high: candles.map((candle) => candle.high),
+      low: candles.map((candle) => candle.low),
+      close: candles.map((candle) => candle.close),
+    });
+    const recentTrueRanges = trueRanges.slice(-period);
+    if (recentTrueRanges.length < period) return null;
+
+    const sumTrueRange = recentTrueRanges.reduce((sum, tr) => sum + tr, 0);
+    const highestHigh = Math.max(...recent.map((candle) => candle.high));
+    const lowestLow = Math.min(...recent.map((candle) => candle.low));
+    const range = highestHigh - lowestLow;
+    if (range <= 0) return null;
+
+    return this.round((100 * Math.log10(sumTrueRange / range)) / Math.log10(period));
   }
 
   /**

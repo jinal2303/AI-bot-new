@@ -25,6 +25,15 @@ const MILESTONE_PERCENTAGES = [30, 40, 50, 60, 70, 80, 90] as const;
  *     triggers an exit) — see `checkTargetMilestones()`.
  *  3. Mandatory EOD square-off — 15 min before the 15:30 IST close,
  *     unconditional. See below.
+ *  3.5. Stale-position SOFT exit (added 2026-09-17, extended 2026-09-18) —
+ *     two conditions, either force-closes early: (a) a position open for
+ *     stalePositionMinutes (default 8) that never reached even
+ *     stalePositionMinFavorableAtrMult (default 0.3x) ATR favorable, or
+ *     (b) — before that deadline — price has already drifted
+ *     stalePositionAdverseAtrMult (default 0.3x) ATR against the trade.
+ *     (b) closes a gap in (a): without it, a trade that stalls early and
+ *     then quietly drifts against you rides the full adverse move before
+ *     the deadline check ever looks at it. See `evaluateStalePositionSoftExit()`.
  *  4. Dynamic Profit Protection — ratchet the stop-loss to breakeven, then
  *     to a locked partial profit, as favorable movement deepens. See
  *     `applyTrailingStop()`.
@@ -63,6 +72,28 @@ export class PositionMonitorService {
   private readonly staleTargetReductionPct: number;
   private readonly staleMinFavorableAtrMult: number;
 
+  // --- Stale-position SOFT exit (added 2026-09-17) ----------------------------
+  // A much earlier, stricter check than the staleExitMinutes rule above:
+  // that one (default 30 min) only fires once a position was in profit and
+  // then gave it back. This one instead catches a trade that never showed
+  // ANY real follow-through at all within the first few minutes — see
+  // `evaluateStalePositionSoftExit()`.
+  private readonly stalePositionMinutes: number;
+  private readonly stalePositionMinFavorableAtrMult: number;
+  /**
+   * EARLY ADVERSE-DRIFT EXIT (added 2026-09-18) — fixes a gap in the rule
+   * above: that check only fires once, right at the stalePositionMinutes
+   * deadline, so a trade that stalls early and then quietly drifts against
+   * you for the next several minutes rides the full adverse move before
+   * anything reacts — turning what should be a near-breakeven "this isn't
+   * working" cut into a real loss. This adds a SECOND, continuously-checked
+   * condition, active only during the same proving window (holdMinutes <
+   * stalePositionMinutes): if current (not peak) unfavorable movement ever
+   * reaches this many x ATR against the trade, exit immediately rather than
+   * waiting for the clock. See `evaluateStalePositionSoftExit()`.
+   */
+  private readonly stalePositionAdverseAtrMult: number;
+
   // --- Mandatory EOD square-off ------------------------------------------------
   private readonly eodSquareOffMinutesBeforeClose: number;
 
@@ -85,7 +116,12 @@ export class PositionMonitorService {
     this.lotSize = Number(this.configService.get<string>('LOT_SIZE', '65'));
     this.deltaProxy = Number(this.configService.get<string>('DELTA_PROXY', '0.5'));
 
-    this.trailBreakevenAtrMult = Number(this.configService.get<string>('TRAIL_BREAKEVEN_ATR_MULT', '1.0'));
+    // Lowered from 1.0 to 0.4 (2026-09-17): at 1.0x ATR, a position that
+    // peaked at 0.6-0.9x ATR favorable — real, meaningful movement — still
+    // got zero protection and could round-trip into a full stop-loss loss.
+    // 0.4x arms breakeven much earlier so a genuine partial move locks in
+    // before it has a chance to fully reverse.
+    this.trailBreakevenAtrMult = Number(this.configService.get<string>('TRAIL_BREAKEVEN_ATR_MULT', '0.4'));
     this.trailProfitLockAtrMult = Number(this.configService.get<string>('TRAIL_PROFIT_LOCK_ATR_MULT', '1.5'));
     this.trailProfitLockFraction = Number(this.configService.get<string>('TRAIL_PROFIT_LOCK_FRACTION', '0.75'));
 
@@ -99,6 +135,14 @@ export class PositionMonitorService {
     this.staleExitMinutes = Number(this.configService.get<string>('STALE_EXIT_MINUTES', '30'));
     this.staleTargetReductionPct = Number(this.configService.get<string>('STALE_TARGET_REDUCTION_PCT', '0.30'));
     this.staleMinFavorableAtrMult = Number(this.configService.get<string>('STALE_MIN_FAVORABLE_ATR_MULT', '0.5'));
+
+    this.stalePositionMinutes = Number(this.configService.get<string>('STALE_POSITION_MINUTES', '8'));
+    this.stalePositionMinFavorableAtrMult = Number(
+      this.configService.get<string>('STALE_POSITION_MIN_FAVORABLE_ATR_MULT', '0.3'),
+    );
+    this.stalePositionAdverseAtrMult = Number(
+      this.configService.get<string>('STALE_POSITION_ADVERSE_ATR_MULT', '0.3'),
+    );
 
     // Tied to the exchange close (minutesUntilMarketClose), not a second
     // hardcoded clock — 15 min before 15:30 IST close = 15:15, the
@@ -190,6 +234,15 @@ export class PositionMonitorService {
       return;
     }
 
+    const holdMinutes = (Date.now() - new Date(position.timestamp).getTime()) / MS_PER_MINUTE;
+
+    // Step 4.5 — Stale-position SOFT exit. See `evaluateStalePositionSoftExit()`.
+    const softExitReason = this.evaluateStalePositionSoftExit(position, peakSpot, livePrice, holdMinutes);
+    if (softExitReason) {
+      await this.resolve(position, TradeStatus.TIME_EXIT, livePrice, peakSpot, softExitReason);
+      return;
+    }
+
     // Step 5 — Dynamic Profit Protection: ratchet the stop-loss toward
     // (and past) breakeven as favorable movement deepens.
     const trailed = this.applyTrailingStop(position, peakSpot);
@@ -218,8 +271,7 @@ export class PositionMonitorService {
     }
 
     // Step 7 — stale-position handling: only relevant once the position has
-    // actually been open for a while.
-    const holdMinutes = (Date.now() - new Date(position.timestamp).getTime()) / MS_PER_MINUTE;
+    // actually been open for a while. (holdMinutes computed earlier, at Step 4.5.)
     if (holdMinutes < this.staleExitMinutes) {
       return;
     }
@@ -459,6 +511,69 @@ export class PositionMonitorService {
     }
 
     return { lockedPct: Math.round(peakProgressFraction * 100) };
+  }
+
+  /**
+   * STALE-POSITION SOFT EXIT (added 2026-09-17, extended 2026-09-18) — a
+   * much earlier, stricter check than `applyStaleExitRule()` below. That
+   * one (default 30 min) only fires for a position that WAS in profit and
+   * has since given it back. This one instead catches a trade that never
+   * showed ANY real follow-through in the first place, via two
+   * independent conditions:
+   *
+   *   1. NO-MOMENTUM DEADLINE (original, 2026-09-17) — once open for
+   *      `stalePositionMinutes` (default 8) with peak favorable movement
+   *      still under `stalePositionMinFavorableAtrMult` x ATR (default
+   *      0.3x — intentionally below the 0.4x trailing-stop breakeven-arm
+   *      trigger, so this never fires for a trade that got close to
+   *      arming real protection), force-close now.
+   *   2. EARLY ADVERSE-DRIFT (added 2026-09-18, fixes a gap in #1) —
+   *      condition 1 only checks ONCE, at the deadline, so a trade that
+   *      stalls early and then quietly drifts against you for several
+   *      minutes rides the full adverse move before anything reacts,
+   *      turning a near-breakeven "this isn't working" cut into a real
+   *      loss. This checks continuously, for the whole proving window
+   *      (holdMinutes < stalePositionMinutes): if CURRENT (not peak)
+   *      unfavorable movement reaches `stalePositionAdverseAtrMult` x ATR
+   *      (default 0.3x) against the trade, exit immediately rather than
+   *      waiting for the deadline. Deliberately NOT gated on peak having
+   *      stayed low — a trade that briefly ticked favorable then reversed
+   *      hard within the same window is exactly the case this closes.
+   *
+   * Requires atr14 (guarded by the caller, same as every other
+   * ATR-dependent rule) and `position.atr14 === null` is already excluded
+   * upstream. Returns the resolve() reason string when the position
+   * should be force-exited this tick, or null to leave it running.
+   */
+  private evaluateStalePositionSoftExit(
+    position: TradeSignal,
+    peakSpot: number,
+    livePrice: number,
+    holdMinutes: number,
+  ): string | null {
+    const { direction, entrySpotPrice, atr14 } = position;
+    const isCall = direction === Direction.CALL;
+
+    if (holdMinutes >= this.stalePositionMinutes) {
+      const peakFavorablePoints = isCall ? peakSpot - entrySpotPrice : entrySpotPrice - peakSpot;
+      const floorPoints = atr14! * this.stalePositionMinFavorableAtrMult;
+      if (peakFavorablePoints >= floorPoints) return null; // Showed real follow-through — leave it running.
+
+      this.logger.log(
+        `Position ${position.id} (${direction} ${position.strikePrice}) stale after ${holdMinutes.toFixed(1)}m — never reached ${this.stalePositionMinFavorableAtrMult}x ATR favorable (peak ${peakFavorablePoints.toFixed(1)}pts < ${floorPoints.toFixed(1)}pts floor) — forcing early TIME_EXIT`,
+      );
+      return `stale position — no follow-through within ${this.stalePositionMinutes}m (peak ${peakFavorablePoints.toFixed(1)}pts < ${floorPoints.toFixed(1)}pts floor)`;
+    }
+
+    // Still within the proving window — check for early adverse drift.
+    const currentFavorablePoints = isCall ? livePrice - entrySpotPrice : entrySpotPrice - livePrice;
+    const adverseFloorPoints = atr14! * this.stalePositionAdverseAtrMult;
+    if (currentFavorablePoints > -adverseFloorPoints) return null; // Not meaningfully against us yet.
+
+    this.logger.log(
+      `Position ${position.id} (${direction} ${position.strikePrice}) drifting against entry after only ${holdMinutes.toFixed(1)}m — ${(-currentFavorablePoints).toFixed(1)}pts adverse >= ${adverseFloorPoints.toFixed(1)}pts floor — forcing early TIME_EXIT rather than waiting out the ${this.stalePositionMinutes}m window`,
+    );
+    return `early adverse drift — ${(-currentFavorablePoints).toFixed(1)}pts against entry within ${holdMinutes.toFixed(1)}m (>= ${adverseFloorPoints.toFixed(1)}pts floor)`;
   }
 
   /**

@@ -109,6 +109,63 @@ export class TradesService {
   }
 
   /**
+   * DAILY LOSS CIRCUIT BREAKER (total) — count of today's resolved trades
+   * with a negative realized `netCashINR`, regardless of which terminal
+   * status they closed at. Broader than `countTodayByStatus(STOPLOSS_HIT)`:
+   * a STOPLOSS_HIT is always a loss, but a TIME_EXIT can legitimately close
+   * negative too (see TIME_EXIT's doc in schema.prisma) — this counts every
+   * losing trade, not just full-risk-stop ones.
+   */
+  async countTodayLosses(): Promise<number> {
+    return this.prisma.tradeSignal.count({
+      where: { dateString: this.todayIso(), netCashINR: { lt: 0 } },
+    });
+  }
+
+  /**
+   * DAILY LOSS CIRCUIT BREAKER (consecutive) — how many of today's most
+   * recently resolved trades, walking backward from the latest, resolved
+   * STOPLOSS_HIT in an unbroken streak. Stops counting at the first
+   * trade (if any) that resolved some other way — a TARGET_HIT or
+   * TRAIL_STOP_HIT in between breaks the streak, same as it would for a
+   * human reading the day's trade log back-to-front.
+   */
+  async consecutiveStoplossHits(): Promise<number> {
+    const todaysResolved = await this.prisma.tradeSignal.findMany({
+      where: { dateString: this.todayIso(), resolvedAt: { not: null } },
+      orderBy: { resolvedAt: 'desc' },
+      select: { currentStatus: true },
+    });
+
+    let streak = 0;
+    for (const trade of todaysResolved) {
+      if (trade.currentStatus !== TradeStatus.STOPLOSS_HIT) break;
+      streak++;
+    }
+    return streak;
+  }
+
+  /**
+   * GLOBAL LOSS COOLDOWN — when the most recently resolved trade in EITHER
+   * direction closed with a negative `netCashINR`. Not restricted to
+   * today's `dateString`, same reasoning as `mostRecentResolutionTime()` —
+   * a loss in the last minutes of one session should still cool down
+   * fresh entries in the first minutes of the next tick cycle. Returns
+   * null if no trade has ever closed at a loss. Unlike
+   * `mostRecentResolutionTime()` (which is per-direction and fires on ANY
+   * resolution, win or loss), this is direction-agnostic and fires only on
+   * a loss — see SignalsService's re-entry cooldown check.
+   */
+  async mostRecentLossTime(): Promise<Date | null> {
+    const last = await this.prisma.tradeSignal.findFirst({
+      where: { netCashINR: { lt: 0 }, resolvedAt: { not: null } },
+      orderBy: { resolvedAt: 'desc' },
+      select: { resolvedAt: true },
+    });
+    return last?.resolvedAt ?? null;
+  }
+
+  /**
    * SAME-STRIKE LOSS BLACKLIST — when this exact (strikePrice, direction)
    * combination — e.g. 23,400 PE — most recently resolved STOPLOSS_HIT. Not
    * restricted to today's `dateString`, same reasoning as
