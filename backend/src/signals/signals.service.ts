@@ -155,6 +155,13 @@ export class SignalsService {
   private readonly atrTargetMultiplier: number;
   private readonly atrStopLossMultiplier: number;
   /**
+   * FIXED TARGET (2026-09-21) — when > 0, every trade's target is exactly
+   * this much profit per lot in rupees (points = cash / (deltaProxy x
+   * lotSize)), overriding both the 2x-ATR distance and pivot target-snapping.
+   * The stop stays ATR-sized. 0 = use the ATR/pivot-based target.
+   */
+  private readonly fixedTargetCashINR: number;
+  /**
    * DYNAMIC MIN-PROFIT FILTER — the target payoff (1 lot) a setup must
    * clear is no longer one fixed rupee figure. It's the greater of:
    *   - `minTargetCashFloorINR` — an absolute sanity floor (brokerage +
@@ -295,6 +302,8 @@ export class SignalsService {
     this.deltaProxy = Number(this.configService.get<string>('DELTA_PROXY', '0.5'));
     this.atrTargetMultiplier = Number(this.configService.get<string>('ATR_TARGET_MULTIPLIER', '2'));
     this.atrStopLossMultiplier = Number(this.configService.get<string>('ATR_STOPLOSS_MULTIPLIER', '1'));
+    const configuredFixedTarget = Number(this.configService.get<string>('TARGET_CASH_INR', '1100'));
+    this.fixedTargetCashINR = Number.isFinite(configuredFixedTarget) && configuredFixedTarget > 0 ? configuredFixedTarget : 0;
 
     // DYNAMIC MIN-PROFIT FILTER — replaces the old fixed MIN_TARGET_CASH_INR.
     // Floor default (₹650 = 10 CE/PE option points × the 65 lot size) is the
@@ -318,13 +327,11 @@ export class SignalsService {
     // just elevated) relative to ~30 min ago, favoring setups more likely to
     // keep running.
     this.atrExpansionMinRatio = Number(this.configService.get<string>('ATR_EXPANSION_MIN_RATIO', '1.05'));
-    // Raised from 12 to 18 (2026-09-18) — ATR14 has been running ~15-21pts
-    // lately, so a 12pt baseline was almost always cleared regardless of
-    // whether volatility was genuinely expanding, making the ratio-expansion
-    // check above nearly irrelevant on most days. 18 sits closer to the
-    // actual recent range, so the baseline bypass only fires when ATR is
-    // genuinely elevated, not just "normal for this market lately".
-    this.atrBaselinePoints = Number(this.configService.get<string>('ATR_BASELINE_POINTS', '18'));
+    // Was raised to 18 on 2026-09-18, put back to 12 on 2026-09-21: at 18 it
+    // blocked steady-trend days (ATR flat at ~12-16, ratio ~1.0), and a
+    // 40-day replay showed the entries it blocked did no worse than the
+    // ones it let through.
+    this.atrBaselinePoints = Number(this.configService.get<string>('ATR_BASELINE_POINTS', '12'));
 
     // MARKET REGIME / CHOP FILTER
     this.adxThreshold = Number(this.configService.get<string>('ADX_THRESHOLD', '20'));
@@ -968,7 +975,13 @@ export class SignalsService {
     const direction = signal === 'BUY CALL (CE)' ? 1 : -1;
     const indexStopLossPoints = this.round(atr14 * this.atrStopLossMultiplier);
     const atrTargetPoints = this.round(atr14 * this.atrTargetMultiplier);
-    const { indexTargetPoints, targetBasis } = this.resolveTargetPoints(direction, entryPrice, atrTargetPoints, atr14, reactionLevels);
+    // Fixed-rupee target mode skips pivot snapping on purpose — a snapped
+    // target can land far past the configured payoff. 'ATR' here just means
+    // "formula-derived, not pivot-derived".
+    const { indexTargetPoints, targetBasis }: { indexTargetPoints: number; targetBasis: 'PIVOT' | 'ATR' } =
+      this.fixedTargetCashINR > 0
+        ? { indexTargetPoints: this.round(this.fixedTargetCashINR / (this.deltaProxy * this.lotSize)), targetBasis: 'ATR' }
+        : this.resolveTargetPoints(direction, entryPrice, atrTargetPoints, atr14, reactionLevels);
 
     const optionTargetPoints = this.round(indexTargetPoints * this.deltaProxy);
     const optionStopLossPoints = this.round(indexStopLossPoints * this.deltaProxy);

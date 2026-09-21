@@ -19,7 +19,7 @@ nothing is queued or retried, the next 60s tick starts over from scratch.
 |---|------|------|----------------|
 | 1 | Daily halt | Daily signal count / stop-loss / total-loss / consecutive-loss circuit breakers | **disabled** (`ENABLE_DAILY_LIMIT=false`) — counts still shown on dashboard, never halts. When enabled, trips on ANY of: signal count ≥10, STOPLOSS_HIT count ≥4, total losing trades ≥3 (`MAX_DAILY_LOSSES`), or a consecutive STOPLOSS_HIT streak ≥2 (`MAX_CONSECUTIVE_LOSSES`) |
 | 2 | Directional read | `spot` vs `SMA9` trend + RSI(14) band agreement | CALL: spot>SMA9 & RSI∈[52,85]. PUT: spot<SMA9 & RSI∈[15,48]. Dead zone RSI 48-52 = no read |
-| 3 | ATR expansion | ATR14 must be expanding OR already high | ratio ≥ **1.05** OR ATR14 ≥ **18** pts (raised from 12 on 2026-09-18 — ATR's been running 15-21pts lately, so 12 was almost always cleared regardless of real expansion) |
+| 3 | ATR expansion | ATR14 must be expanding OR already high | ratio ≥ **1.05** OR ATR14 ≥ **12** pts (raised to 18 on 2026-09-18, put back to 12 on 2026-09-21 — at 18 it blocked steady-trend days where ATR stays flat, and a 40-day replay showed the entries it blocked did no worse than the ones it passed) |
 | 4 | Market regime / chop filter (added 2026-09-17, tightened to AND 2026-09-18) | Must show real trend strength AND low chop — not either alone | ADX(14) ≥ **20** (`ADX_THRESHOLD`) **AND** Choppiness Index(14) ≤ **60** (`CHOPPINESS_INDEX_MAX`). Was OR — a real trade slipped through on adx14=12.4 (failed) alone passing via chop14=58.8, barely under 60; it peaked only 1.5pts favorable before reversing. Each side still fails open (passes) on insufficient history. A volume-based gate was considered and skipped — see the caveat below the table |
 | 5 | Structural reaction | Must breakout/breakdown, or bounce/reject, off a real level | Requires **PIVOT/FALLBACK-only** confirmation in **every** session window (daily pivot, session VWAP, or morning high/low — not a plain intraday swing) — tightened 2026-09-16, previously Mid-Day only |
 | 5b | ↳ Sustained-trend bypass | If #5 fails: ≥3 consecutive trend-agreement 5m bars AND ATR14 ≥ 15 still passes | `SUSTAINED_TREND_MIN_BARS=3`, `SUSTAINED_TREND_ATR_BASELINE=15` |
@@ -37,16 +37,25 @@ compare 0 against 0, making it a permanent silent no-op rather than a real
 filter — so it was deliberately left out instead of shipped as dead code
 that looks like protection but isn't.
 
-**Target/stop-loss sizing** (`buildTradeRules()`, `signals.service.ts:823`):
+**Target/stop-loss sizing** (`buildTradeRules()` in `signals.service.ts`):
 - `stopLossPoints = ATR14 × 1` (`ATR_STOPLOSS_MULTIPLIER=1`)
-- `targetPoints = ATR14 × 2` (`ATR_TARGET_MULTIPLIER=2`), **unless** a structural
-  level sits ≥ `2× ATR14` away in the favorable direction (`STRUCTURE_MIN_TARGET_ATR_MULT=2`)
-  — then the target snaps to that level instead (`targetBasis: 'PIVOT'`).
+- **Fixed target (since 2026-09-21)**: `TARGET_CASH_INR=1100` → target is exactly
+  ₹1,100 per lot = `1100 / (0.5 × 65)` ≈ **33.85 Nifty points** (~16.9 option
+  points), whatever ATR is, with no pivot snapping. Set `TARGET_CASH_INR=0` to go back
+  to the old rule: `ATR14 × 2` (`ATR_TARGET_MULTIPLIER`), snapped to a structural level
+  ≥ 2× ATR away when one exists.
+- Because the stop is ATR-sized and the target fixed, reward:risk now moves with volatility:
+  ATR 12 → ~2.8:1, ATR 20 → ~1.7:1. Setups with ATR above ~34 fail the min-profit gate
+  (the stop would cost more than the target pays).
 
-This means every trade enters with a **2:1 reward:risk ratio at best**
-(sometimes wider if pivot-snapped). Under a no-edge random-walk assumption,
-2:1 R:R implies roughly a **33% win rate** is "expected" — the strategy is
-designed around fewer, bigger wins rather than a high hit rate.
+**What this does and doesn't buy you**: under a no-edge random walk, the chance
+of hitting the target before the stop is about `stop / (stop + target)` — roughly 26% at
+a 12pt stop and 34pt target, 33% at 17pt, 50% at 34pt. A 40-day replay (2026-09-21) of
+this entry logic hit its targets at almost exactly those rates, and random-direction
+entries did the same, so the entry signal shows no measurable edge over chance. A
+bigger target raises the payoff per win, not the win rate; ~70-80% wins would need a
+stop of roughly ₹3,000+ per losing trade. Option decay (theta) and brokerage are not
+in the delta-0.5 P&L proxy, so real results will be worse than these figures.
 
 ## 2. Exit / trade-management pipeline (`PositionMonitorService`, runs every 10s)
 

@@ -228,7 +228,7 @@ export function SignalCard({ signal, isLoading, activeEntry }: SignalCardProps) 
               Stop-loss sized off ATR(14) = {rules.atr14} pts (SL {(rules.indexStopLossPoints / rules.atr14).toFixed(1)}×)
               {rules.targetBasis === 'PIVOT'
                 ? ' — target set at the nearest support/resistance pivot, not ATR'
-                : ` — target ${(rules.indexTargetPoints / rules.atr14).toFixed(1)}× ATR (no qualifying pivot nearby)`}
+                : ` — target ${(rules.indexTargetPoints / rules.atr14).toFixed(1)}× ATR`}
             </p>
             <p className="text-xs text-muted-foreground">
               Option premium proxy: SL {rules.optionStopLossPoints} pts · Target {rules.optionTargetPoints} pts
