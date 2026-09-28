@@ -11,7 +11,7 @@ import {
   TradeStatusChangedPayload,
 } from '../trades/trade-events';
 
-const allowedOrigins = (process.env.CORS_ORIGIN ?? 'http://localhost:3000')
+const allowedOrigins = (process.env.CORS_ORIGIN ?? 'http://localhost:3000,https://ai-bot-new-seven.vercel.app')
   .split(',')
   .map((origin) => origin.trim());
 

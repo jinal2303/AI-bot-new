@@ -6,7 +6,7 @@ async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule);
   const logger = new Logger('Bootstrap');
 
-  const corsOrigin = process.env.CORS_ORIGIN ?? 'http://localhost:3000';
+  const corsOrigin = process.env.CORS_ORIGIN ?? 'http://localhost:3000,https://ai-bot-new-seven.vercel.app';
   app.enableCors({
     origin: corsOrigin.split(',').map((origin) => origin.trim()),
     methods: ['GET'],
