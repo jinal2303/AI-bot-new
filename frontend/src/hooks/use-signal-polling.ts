@@ -5,7 +5,7 @@ import { fetchLatestSignal } from '@/lib/api';
 import { requestNotificationPermission } from '@/lib/notifications';
 import { SignalData } from '@/lib/types';
 
-const POLL_INTERVAL_MS = 5_000;
+const POLL_INTERVAL_MS = 10;
 
 export interface UseSignalPollingResult {
   signal: SignalData | null;

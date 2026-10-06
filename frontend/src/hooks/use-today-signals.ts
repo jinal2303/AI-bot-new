@@ -5,7 +5,7 @@ import { fetchTodaySignals } from '@/lib/api';
 import { notifyNewEntry } from '@/lib/notifications';
 import { TradeSignal } from '@/lib/trade-signal';
 
-const POLL_INTERVAL_MS = 5_000;
+const POLL_INTERVAL_MS = 10;
 
 export interface UseTodaySignalsResult {
   signals: TradeSignal[];
